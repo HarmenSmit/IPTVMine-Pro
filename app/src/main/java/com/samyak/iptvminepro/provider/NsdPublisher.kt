@@ -11,12 +11,13 @@ class NsdPublisher(private val context: Context) {
     private var registrationListener: NsdManager.RegistrationListener? = null
 
     fun registerService(port: Int, serviceName: String = "IPTVMinePro-Phone") {
-        val serviceInfo = NsdServiceInfo().apply {
+        val newServiceInfo = NsdServiceInfo().apply {
             this.serviceName = serviceName
             this.serviceType = "_iptv_pair._tcp"
             this.port = port
         }
-        this.serviceInfo = serviceInfo
+        // BUG-013 fix: use distinct name to avoid shadowing the instance field
+        this.serviceInfo = newServiceInfo
 
         registrationListener = object : NsdManager.RegistrationListener {
             override fun onServiceRegistered(info: NsdServiceInfo) {
@@ -37,19 +38,19 @@ class NsdPublisher(private val context: Context) {
         }
 
         try {
-            nsdManager.registerService(serviceInfo, NsdManager.PROTOCOL_DNS_SD, registrationListener)
+            nsdManager.registerService(newServiceInfo, NsdManager.PROTOCOL_DNS_SD, registrationListener)
         } catch (e: Exception) {
             Log.e("NsdPublisher", "Error registering NSD service", e)
         }
     }
 
     fun unregisterService() {
-        registrationListener?.let {
-            try {
-                nsdManager.unregisterService(it)
-            } catch (e: Exception) {
-                Log.e("NsdPublisher", "Error unregistering NSD service", e)
-            }
+        // BUG-013 fix: guard against double-unregister (null check before calling)
+        val listener = registrationListener ?: return
+        try {
+            nsdManager.unregisterService(listener)
+        } catch (e: Exception) {
+            Log.e("NsdPublisher", "Error unregistering NSD service", e)
         }
         registrationListener = null
     }

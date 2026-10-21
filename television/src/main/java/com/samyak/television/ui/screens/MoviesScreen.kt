@@ -47,6 +47,7 @@ fun MoviesScreen(
     val providerRepository = remember { ProviderRepository(context) }
     val extensionRepository = remember { ExtensionRepository.getInstance(context) }
     val runner = remember { VegaProviderRunner(context) }
+    val cacheStore = remember { com.samyak.television.data.MovieCacheStore.getInstance(context) }
     
     val vegaProviders = remember { providerRepository.getProviders().filter { it.isActive && it.safeType == ProviderType.VEGA } }
     
@@ -60,23 +61,34 @@ fun MoviesScreen(
     
     val installedExtensionsState by extensionRepository.installedExtensionsFlow.collectAsState()
 
-    // 1. Fetch scrapers/extensions for selected provider
+    // 1. Fetch scrapers/extensions for selected provider with cache memory
     LaunchedEffect(selectedProvider, installedExtensionsState) {
         val provider = selectedProvider
         if (provider != null) {
-            isScrapersLoading = true
+            val cachedScrapers = cacheStore.getScrapers(provider.url)?.filter { it.value in installedExtensionsState }
+            if (!cachedScrapers.isNullOrEmpty() && scrapers.isEmpty()) {
+                scrapers = cachedScrapers
+                if (selectedScraper == null) {
+                    selectedScraper = cachedScrapers.firstOrNull()
+                }
+            } else if (scrapers.isEmpty()) {
+                isScrapersLoading = true
+            }
             try {
                 val manifest = runner.fetchManifest(provider.url)
                 val installed = manifest.filter { it.value in installedExtensionsState }
                 scrapers = installed
+                cacheStore.putScrapers(provider.url, manifest)
                 
                 if (selectedScraper == null || !scrapers.any { it.value == selectedScraper?.value }) {
                     selectedScraper = scrapers.firstOrNull()
                 }
             } catch (e: Exception) {
                 Log.e("TVMoviesScreen", "Error loading scrapers", e)
-                scrapers = emptyList()
-                selectedScraper = null
+                if (scrapers.isEmpty()) {
+                    scrapers = emptyList()
+                    selectedScraper = null
+                }
             } finally {
                 isScrapersLoading = false
             }
@@ -86,15 +98,35 @@ fun MoviesScreen(
         }
     }
 
-    // 2. Fetch catalog and posts for selected scraper
+    // 2. Fetch catalog and posts for selected scraper with cache memory
     LaunchedEffect(selectedProvider, selectedScraper) {
         val provider = selectedProvider
         val scraper = selectedScraper
         if (provider != null && scraper != null) {
-            isMoviesLoading = true
-            moviesByCategory = emptyMap()
+            // Immediate cache memory restore
+            val cachedCats = cacheStore.getCategories(provider.url, scraper.value)
+            if (!cachedCats.isNullOrEmpty()) {
+                val cachedMap = mutableMapOf<VegaCatalog, List<VegaPost>>()
+                for (cat in cachedCats.take(6)) {
+                    val cachedPosts = cacheStore.getMovies(provider.url, scraper.value, cat.filter)
+                    if (!cachedPosts.isNullOrEmpty()) {
+                        cachedMap[cat] = cachedPosts.take(15)
+                    }
+                }
+                if (cachedMap.isNotEmpty()) {
+                    moviesByCategory = cachedMap
+                    isMoviesLoading = false
+                }
+            }
+
+            if (moviesByCategory.isEmpty()) {
+                isMoviesLoading = true
+            }
             try {
                 val (catalogs, _) = runner.getCatalog(provider.url, scraper.value)
+                if (catalogs.isNotEmpty()) {
+                    cacheStore.putCategories(provider.url, scraper.value, catalogs)
+                }
                 val postsMap = mutableMapOf<VegaCatalog, List<VegaPost>>()
                 
                 val catalogsToFetch = catalogs.take(6)
@@ -102,6 +134,7 @@ fun MoviesScreen(
                     val posts = runner.getPosts(provider.url, scraper.value, filter = "", page = 1)
                     if (posts.isNotEmpty()) {
                         moviesByCategory = mapOf(VegaCatalog("Featured", "") to posts.take(15))
+                        cacheStore.putMovies(provider.url, scraper.value, "", posts)
                     }
                 } else {
                     for (cat in catalogsToFetch) {
@@ -109,12 +142,15 @@ fun MoviesScreen(
                         if (posts.isNotEmpty()) {
                             postsMap[cat] = posts.take(15)
                             moviesByCategory = postsMap.toMap() // Update state incrementally
+                            cacheStore.putMovies(provider.url, scraper.value, cat.filter, posts)
                         }
                     }
                 }
             } catch (e: Exception) {
                 Log.e("TVMoviesScreen", "Error loading catalog/movies", e)
-                moviesByCategory = emptyMap()
+                if (moviesByCategory.isEmpty()) {
+                    moviesByCategory = emptyMap()
+                }
             } finally {
                 isMoviesLoading = false
             }

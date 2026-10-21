@@ -4,17 +4,20 @@ import android.widget.Toast
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.*
+import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.LazyRow
 import androidx.compose.foundation.lazy.grid.GridCells
 import androidx.compose.foundation.lazy.grid.LazyVerticalGrid
 import androidx.compose.foundation.lazy.grid.itemsIndexed
 import androidx.compose.foundation.lazy.grid.rememberLazyGridState
 import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.lazy.itemsIndexed
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.KeyboardActions
 import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
+import androidx.compose.material.icons.automirrored.filled.ArrowForward
 import androidx.compose.material.icons.filled.Close
 import androidx.compose.material.icons.filled.Search
 import androidx.compose.material3.*
@@ -24,6 +27,7 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalSoftwareKeyboardController
+import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.ImeAction
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
@@ -57,6 +61,7 @@ fun MovieSearchScreen(
 
     val searchQuery by viewModel.searchQuery.collectAsState()
     val movies by viewModel.movies.collectAsState()
+    val moviesByScraper by viewModel.moviesByScraper.collectAsState()
     val isLoading by viewModel.isLoading.collectAsState()
     val hasMore by viewModel.hasMore.collectAsState()
     val errorMessage by viewModel.errorMessage.collectAsState()
@@ -143,7 +148,7 @@ fun MovieSearchScreen(
                 modifier = Modifier
                     .fillMaxSize()
                     .padding(innerPadding)
-                    .background(Color.White)
+                    .background(MaterialTheme.colorScheme.background)
             ) {
                 Column(modifier = Modifier.fillMaxSize()) {
                     // Scraper filter chips if multiple extensions
@@ -154,6 +159,22 @@ fun MovieSearchScreen(
                                 .padding(horizontal = 16.dp, vertical = 6.dp),
                             horizontalArrangement = Arrangement.spacedBy(8.dp)
                         ) {
+                            item {
+                                val isAllSelected = selectedScraper == null
+                                FilterChip(
+                                    selected = isAllSelected,
+                                    onClick = { viewModel.selectAllScrapers() },
+                                    label = { Text("All", fontSize = 13.sp) },
+                                    colors = FilterChipDefaults.filterChipColors(
+                                        selectedContainerColor = Color(0xFF26A69A),
+                                        selectedLabelColor = Color.White,
+                                        containerColor = MaterialTheme.colorScheme.surfaceVariant,
+                                        labelColor = MaterialTheme.colorScheme.onSurfaceVariant
+                                    ),
+                                    border = null,
+                                    shape = RoundedCornerShape(8.dp)
+                                )
+                            }
                             items(scrapers) { scraper ->
                                 val isSelected = selectedScraper?.value == scraper.value
                                 FilterChip(
@@ -163,8 +184,8 @@ fun MovieSearchScreen(
                                     colors = FilterChipDefaults.filterChipColors(
                                         selectedContainerColor = Color(0xFF26A69A),
                                         selectedLabelColor = Color.White,
-                                        containerColor = Color(0xFFF5F5F5),
-                                        labelColor = Color(0xFF6B7280)
+                                        containerColor = MaterialTheme.colorScheme.surfaceVariant,
+                                        labelColor = MaterialTheme.colorScheme.onSurfaceVariant
                                     ),
                                     border = null,
                                     shape = RoundedCornerShape(8.dp)
@@ -178,67 +199,173 @@ fun MovieSearchScreen(
                             .fillMaxWidth()
                             .weight(1f)
                     ) {
+                        val emptyMessage = when {
+                            activeProviders.isEmpty() -> "Please add a Vega Movies provider in Settings"
+                            scrapers.isEmpty() && !isScrapersLoading -> "No extensions installed. Please install an extension from Settings."
+                            searchQuery.isBlank() -> "Type in the search bar to find movies and TV shows"
+                            else -> "No results found for \"$searchQuery\""
+                        }
+
                         if (activeProviders.isEmpty()) {
                             Box(modifier = Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
                                 Text(
-                                    text = "Please add a Vega Movies provider in Settings",
-                                    color = Color(0xFF6B7280),
+                                    text = emptyMessage,
+                                    color = MaterialTheme.colorScheme.onBackground.copy(alpha = 0.6f),
                                     fontSize = 16.sp
                                 )
                             }
-                        } else if (movies.isEmpty() && !isLoading && !isScrapersLoading) {
+                        } else if (scrapers.isEmpty() && !isScrapersLoading) {
                             Box(modifier = Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
                                 Text(
-                                    text = if (scrapers.isEmpty()) "No extensions installed. Please install an extension from Settings." else "No movies or shows found",
-                                    color = Color(0xFF6B7280),
+                                    text = emptyMessage,
+                                    color = MaterialTheme.colorScheme.onBackground.copy(alpha = 0.6f),
                                     fontSize = 16.sp
                                 )
                             }
-                        } else {
-                            LazyVerticalGrid(
-                                columns = GridCells.Fixed(3),
-                                state = gridState,
-                                contentPadding = PaddingValues(16.dp),
-                                horizontalArrangement = Arrangement.spacedBy(12.dp),
-                                verticalArrangement = Arrangement.spacedBy(16.dp),
-                                modifier = Modifier.fillMaxSize()
-                            ) {
-                                itemsIndexed(movies) { _, movie ->
-                                    val provider = selectedProvider
-                                    val scraper = selectedScraper
-                                    MovieCard(
-                                        movie = movie,
-                                        onClick = {
-                                            if (provider != null && scraper != null) {
-                                                onMovieClick(movie, scraper, provider)
-                                            }
-                                        }
+                        } else if (selectedScraper == null) {
+                            // ── MULTI-EXTENSION SECTIONS VIEW (matches second image!) ──────────────────
+                            if (moviesByScraper.isEmpty() && !isLoading && !isScrapersLoading) {
+                                Box(modifier = Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
+                                    Text(
+                                        text = emptyMessage,
+                                        color = MaterialTheme.colorScheme.onBackground.copy(alpha = 0.6f),
+                                        fontSize = 16.sp
                                     )
                                 }
+                            } else {
+                                LazyColumn(
+                                    contentPadding = PaddingValues(16.dp),
+                                    verticalArrangement = Arrangement.spacedBy(16.dp),
+                                    modifier = Modifier.fillMaxSize()
+                                ) {
+                                    moviesByScraper.forEach { (scraper, movieList) ->
+                                        if (movieList.isNotEmpty()) {
+                                            item(key = scraper.value) {
+                                                Column(
+                                                    modifier = Modifier
+                                                        .fillMaxWidth()
+                                                        .padding(bottom = 16.dp)
+                                                ) {
+                                                    // Section Header (exact style of Image 2!)
+                                                    Row(
+                                                        modifier = Modifier
+                                                            .fillMaxWidth()
+                                                            .clickable { viewModel.selectScraper(scraper) }
+                                                            .padding(bottom = 12.dp),
+                                                        verticalAlignment = Alignment.CenterVertically,
+                                                        horizontalArrangement = Arrangement.SpaceBetween
+                                                    ) {
+                                                        Text(
+                                                            text = scraper.display_name,
+                                                            style = MaterialTheme.typography.titleMedium,
+                                                            fontWeight = FontWeight.Bold,
+                                                            color = MaterialTheme.colorScheme.onBackground
+                                                        )
+                                                        Icon(
+                                                            imageVector = Icons.AutoMirrored.Filled.ArrowForward,
+                                                            contentDescription = "View All",
+                                                            tint = MaterialTheme.colorScheme.primary,
+                                                            modifier = Modifier.size(20.dp)
+                                                        )
+                                                    }
 
-                                if (isLoading && movies.isNotEmpty()) {
-                                    item(span = { androidx.compose.foundation.lazy.grid.GridItemSpan(3) }) {
-                                        Box(
-                                            modifier = Modifier
-                                                .fillMaxWidth()
-                                                .padding(16.dp),
-                                            contentAlignment = Alignment.Center
-                                        ) {
-                                            CircularProgressIndicator(
-                                                color = Color(0xFF26A69A),
-                                                modifier = Modifier.size(36.dp)
-                                            )
+                                                    // Horizontal Carousel of MovieCards (exact style of Image 2!)
+                                                    LazyRow(
+                                                        horizontalArrangement = Arrangement.spacedBy(12.dp),
+                                                        modifier = Modifier.fillMaxWidth()
+                                                    ) {
+                                                        itemsIndexed(
+                                                            movieList,
+                                                            key = { index, movie ->
+                                                                if (movie.link.isNotBlank()) "${movie.link}_$index" else "${scraper.value}_${movie.title}_$index"
+                                                            }
+                                                        ) { _, movie ->
+                                                            MovieCard(
+                                                                movie = movie,
+                                                                onClick = {
+                                                                    val provider = selectedProvider
+                                                                    if (provider != null) {
+                                                                        onMovieClick(movie, scraper, provider)
+                                                                    }
+                                                                },
+                                                                modifier = Modifier.width(130.dp)
+                                                            )
+                                                        }
+                                                    }
+                                                }
+                                            }
                                         }
                                     }
                                 }
                             }
-                        }
 
-                        // Only show shimmer placeholder when loading AND no cached/loaded movies in memory
-                        if ((isLoading || isScrapersLoading) && movies.isEmpty()) {
-                            com.samyak.iptvminepro.ui.components.GridShimmerPlaceholder(
-                                modifier = Modifier.align(Alignment.TopCenter)
-                            )
+                            // Shimmer placeholder for sections when loading
+                            if ((isLoading || isScrapersLoading) && moviesByScraper.isEmpty()) {
+                                com.samyak.iptvminepro.ui.components.HomeShimmerPlaceholder(
+                                    modifier = Modifier.align(Alignment.TopCenter)
+                                )
+                            } else if (isLoading && moviesByScraper.isNotEmpty()) {
+                                LinearProgressIndicator(
+                                    modifier = Modifier.fillMaxWidth().align(Alignment.TopCenter),
+                                    color = Color(0xFF26A69A)
+                                )
+                            }
+                        } else {
+                            // ── SINGLE EXTENSION GRID VIEW (with pagination) ────────────────────────
+                            if (movies.isEmpty() && !isLoading && !isScrapersLoading) {
+                                Box(modifier = Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
+                                    Text(
+                                        text = emptyMessage,
+                                        color = MaterialTheme.colorScheme.onBackground.copy(alpha = 0.6f),
+                                        fontSize = 16.sp
+                                    )
+                                }
+                            } else {
+                                LazyVerticalGrid(
+                                    columns = GridCells.Fixed(3),
+                                    state = gridState,
+                                    contentPadding = PaddingValues(16.dp),
+                                    horizontalArrangement = Arrangement.spacedBy(12.dp),
+                                    verticalArrangement = Arrangement.spacedBy(16.dp),
+                                    modifier = Modifier.fillMaxSize()
+                                ) {
+                                    itemsIndexed(movies) { _, movie ->
+                                        val provider = selectedProvider
+                                        val scraper = selectedScraper
+                                        MovieCard(
+                                            movie = movie,
+                                            onClick = {
+                                                if (provider != null && scraper != null) {
+                                                    onMovieClick(movie, scraper, provider)
+                                                }
+                                            }
+                                        )
+                                    }
+
+                                    if (isLoading && movies.isNotEmpty()) {
+                                        item(span = { androidx.compose.foundation.lazy.grid.GridItemSpan(3) }) {
+                                            Box(
+                                                modifier = Modifier
+                                                    .fillMaxWidth()
+                                                    .padding(16.dp),
+                                                contentAlignment = Alignment.Center
+                                            ) {
+                                                CircularProgressIndicator(
+                                                    color = Color(0xFF26A69A),
+                                                    modifier = Modifier.size(36.dp)
+                                                )
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+
+                            // Only show shimmer placeholder when loading AND no cached/loaded movies in memory
+                            if ((isLoading || isScrapersLoading) && movies.isEmpty()) {
+                                com.samyak.iptvminepro.ui.components.GridShimmerPlaceholder(
+                                    modifier = Modifier.align(Alignment.TopCenter)
+                                )
+                            }
                         }
                     }
                 }

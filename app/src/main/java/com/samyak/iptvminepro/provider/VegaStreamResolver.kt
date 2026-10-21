@@ -32,8 +32,9 @@ class VegaStreamResolver(context: Context) : StreamResolver {
         }
         scope.launch {
             try {
-                val streams = runner.getStream(providerUrl, scraperValue, link, type)
-                    .filter { it.link.isNotBlank() }
+                val streams = com.samyak.iptvminepro.model.prioritizeStreams(
+                    runner.getStream(providerUrl, scraperValue, link, type).filter { it.link.isNotBlank() }
+                )
                 if (streams.isEmpty()) {
                     callback(null, "No stream links found")
                 } else {

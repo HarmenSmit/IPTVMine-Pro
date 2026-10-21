@@ -300,6 +300,15 @@ class ChannelsProvider(application: Application) : AndroidViewModel(application)
                         continue
                     }
 
+                    // BUG-021 fix: validate URL scheme to prevent local file read (SSRF)
+                    val scheme = URL(sourceUrl).protocol
+                    if (scheme != "http" && scheme != "https") {
+                        errorMessages.append("Source ${index + 1}: Rejected — unsupported URL scheme '$scheme'. Only http/https allowed.\n")
+                        channelCounts[sourceUrl] = 0
+                        Log.w(TAG, "Rejected non-http URL scheme '$scheme' for source ${index + 1}: $sourceUrl")
+                        continue
+                    }
+
                     val url = URL(sourceUrl)
                     connection = url.openConnection() as HttpURLConnection
                     connection.connectTimeout = CONNECT_TIMEOUT
@@ -336,7 +345,8 @@ class ChannelsProvider(application: Application) : AndroidViewModel(application)
                             var line: String?
                             var totalRead = 0L
                             while (reader.readLine().also { line = it } != null) {
-                                totalRead += (line?.length ?: 0) + 1
+                                // BUG-015 fix: use actual byte length (not char count) for accurate UTF-8 cap
+                                totalRead += (line?.toByteArray(Charsets.UTF_8)?.size ?: 0) + 1
                                 if (totalRead > MAX_RESPONSE_SIZE) {
                                     Log.w(TAG, "Aborting read — response exceeded $MAX_RESPONSE_SIZE bytes for source ${index + 1}")
                                     break
@@ -360,6 +370,8 @@ class ChannelsProvider(application: Application) : AndroidViewModel(application)
                         
                         Log.d(TAG, "Loaded ${channels.size} channels from source ${index + 1}")
                     } else {
+                        // BUG-007 fix: drain the error stream to release the TCP socket back to the pool
+                        try { connection.errorStream?.close() } catch (_: Exception) {}
                         errorMessages.append("Source ${index + 1}: HTTP ${connection.responseCode}\n")
                         channelCounts[sourceUrl] = 0
                         recordSourceFailure(sourceUrl)
@@ -1003,7 +1015,7 @@ class ChannelsProvider(application: Application) : AndroidViewModel(application)
         val filtered = ArrayList<Channel>()
 
         for (channel in allChannels) {
-            val categoryMatch = category.isNullOrEmpty() || category == "All" || category == channel.category
+            val categoryMatch = category.isNullOrEmpty() || category.equals("all", ignoreCase = true) || category == channel.category
             val queryMatch = lowerCaseQuery.isEmpty() || channel.name.lowercase().contains(lowerCaseQuery)
 
             if (categoryMatch && queryMatch) {

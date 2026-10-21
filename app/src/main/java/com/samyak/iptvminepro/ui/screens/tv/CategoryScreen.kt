@@ -86,6 +86,8 @@ fun CategoryScreen(
     val movieCategories by moviesViewModel.categories.collectAsState()
     val isMoviesLoading by moviesViewModel.isLoading.collectAsState()
 
+    val hasTv = channels.isNotEmpty()
+
     // Determine initial tab:
     // If no TV source URLs configured or channels empty, default to MOVIES.
     // Otherwise default to LIVE_TV.
@@ -96,9 +98,8 @@ fun CategoryScreen(
         )
     }
 
-    // Auto-switch to MOVIES if Live TV has no source URLs configured and user hasn't explicitly tapped Live TV
-    LaunchedEffect(channels, tvErrorMessage) {
-        if (!userManuallySelectedTab && channels.isEmpty() && tvErrorMessage == "No source URLs configured") {
+    LaunchedEffect(hasTv) {
+        if (!hasTv) {
             selectedTab = CategoryTabType.MOVIES
         }
     }
@@ -108,7 +109,8 @@ fun CategoryScreen(
             .fillMaxSize()
             .background(MaterialTheme.colorScheme.background)
     ) {
-        // Top TabRow to toggle between Movies and Live TV
+        // Top TabRow to toggle between Movies and Live TV (only shown if Live TV channels exist)
+        if (hasTv) {
         TabRow(
             selectedTabIndex = selectedTab.ordinal,
             containerColor = Color.White,
@@ -193,6 +195,7 @@ fun CategoryScreen(
                     }
                 }
             )
+        }
         }
 
         // Tab Content

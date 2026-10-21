@@ -10,6 +10,8 @@ import android.util.Log
 import com.samyak.iptvminepro.model.*
 import com.samyak.iptvminepro.utils.TitleUtils.cleanTitle
 import kotlinx.coroutines.*
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import okhttp3.*
 import okhttp3.MediaType.Companion.toMediaTypeOrNull
 import okhttp3.RequestBody.Companion.toRequestBody
@@ -23,6 +25,7 @@ class VegaProviderRunner(private val context: Context) {
     @Volatile
     private var webViewReady = CompletableDeferred<Unit>()
     private val bridge = AndroidBridge()
+    private val runnerMutex = Mutex()
 
     @Volatile
     private var currentUserAgent: String = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
@@ -75,7 +78,9 @@ class VegaProviderRunner(private val context: Context) {
         .cookieJar(cookieJar)
         .dns(appDns)
         .addInterceptor { chain ->
-            // Retry interceptor: retry up to 2 times on failure
+            // BUG-008 fix: removed Thread.sleep() from interceptor to avoid blocking thread pool.
+            // Retry logic with coroutine-safe delay is now handled at call-site level.
+            // Simple pass-through: retry on 5xx up to 2 times using reconnect, not sleep.
             var lastException: Exception? = null
             for (attempt in 0..2) {
                 try {
@@ -86,9 +91,8 @@ class VegaProviderRunner(private val context: Context) {
                     response.close()
                 } catch (e: Exception) {
                     lastException = e
-                    if (attempt < 2) {
-                        Thread.sleep((500 * (attempt + 1)).toLong())
-                    }
+                    // Do NOT sleep here — OkHttp threads are shared; sleeping starves other requests.
+                    // The caller (fetchFile/httpFetch) handles delays at the coroutine level.
                 }
             }
             throw lastException ?: Exception("Request failed after 3 attempts")
@@ -338,6 +342,8 @@ class VegaProviderRunner(private val context: Context) {
                 return withTimeout(90_000) { deferred.await() }
             } catch (e: TimeoutCancellationException) {
                 Log.e(TAG, "JS evaluation timed out after 90s on attempt $attempt")
+                // BUG-010 fix: remove the timed-out callback from the registry to prevent memory leak
+                bridge.removeCallback(callbackId)
                 deferred.cancel()
                 lastException = Exception("JS evaluation timed out")
                 if (attempt < 3) {
@@ -348,6 +354,7 @@ class VegaProviderRunner(private val context: Context) {
                     delay(1000)
                 }
             } catch (e: Exception) {
+                bridge.removeCallback(callbackId)
                 deferred.cancel()
                 throw e
             }
@@ -1322,16 +1329,18 @@ class VegaProviderRunner(private val context: Context) {
         isCompatInjected = true
     }
 
-    private val loadedScrapers = mutableSetOf<String>()
+    private val loadedScrapers = java.util.Collections.synchronizedSet(mutableSetOf<String>())
 
-    suspend fun loadScraper(repoUrl: String, providerValue: String) {
+    private suspend fun loadScraperInternal(repoUrl: String, providerValue: String) {
         val resolvedRepo = resolveRepoUrl(repoUrl).ifBlank { DEFAULT_VEGA_REPO }
+        // BUG-002 fix: sanitize providerValue before embedding in JS to prevent code injection
+        val safeProviderValue = providerValue.replace("\\", "\\\\").replace("'", "\\'")
         // Skip if already loaded
         if (loadedScrapers.contains("${resolvedRepo}::${providerValue}")) {
             // Still update providerValue on context safely
             evalJsDirect("""
                 if (typeof window.providerContext === 'undefined') { window.providerContext = {}; }
-                window.providerContext.providerValue = '$providerValue';
+                window.providerContext.providerValue = '$safeProviderValue';
             """.trimIndent())
             return
         }
@@ -1341,7 +1350,7 @@ class VegaProviderRunner(private val context: Context) {
         // Set the providerValue on the context so scrapers can access it safely
         evalJsDirect("""
             if (typeof window.providerContext === 'undefined') { window.providerContext = {}; }
-            window.providerContext.providerValue = '$providerValue';
+            window.providerContext.providerValue = '$safeProviderValue';
         """.trimIndent())
         
         // Priority order of repositories to attempt fetching scraper modules
@@ -1400,6 +1409,10 @@ class VegaProviderRunner(private val context: Context) {
                     js.contains("cinemeta", ignoreCase = true)) {
                     js = patchCinemetaMetaJs(js)
                 }
+                if (providerValue.equals("kissKh", ignoreCase = true) && module == "posts") {
+                    js = patchKissKhPostsJs(js)
+                }
+                // BUG-016 fix: use safeProviderValue (already sanitized above) in wrapper template
                 val base64Js = android.util.Base64.encodeToString(js.toByteArray(), android.util.Base64.NO_WRAP)
                 val wrapper = """
                     (function() {
@@ -1412,14 +1425,14 @@ class VegaProviderRunner(private val context: Context) {
                             console.error("Error executing $module:", e);
                         }
                         if (!window.vegaModules) window.vegaModules = {};
-                        if (!window.vegaModules['$providerValue']) window.vegaModules['$providerValue'] = {};
+                        if (!window.vegaModules['$safeProviderValue']) window.vegaModules['$safeProviderValue'] = {};
                         var moduleExports = module.exports;
                         if (moduleExports && moduleExports.__esModule && moduleExports.default) {
                             if (typeof moduleExports.default === 'object' && moduleExports.default !== null) {
                                 moduleExports = Object.assign({}, moduleExports, moduleExports.default);
                             }
                         }
-                        window.vegaModules['$providerValue']['$module'] = moduleExports || {};
+                        window.vegaModules['$safeProviderValue']['$module'] = moduleExports || {};
                         window.AndroidBridge.onResult('__CALLBACK_ID__', 'ok');
                     })();
                 """.trimIndent()
@@ -1430,6 +1443,10 @@ class VegaProviderRunner(private val context: Context) {
             }
         }
         loadedScrapers.add("${resolvedRepo}::${providerValue}")
+    }
+
+    suspend fun loadScraper(repoUrl: String, providerValue: String) = runnerMutex.withLock {
+        loadScraperInternal(repoUrl, providerValue)
     }
 
     suspend fun fetchManifest(repoUrl: String): List<VegaProvider> {
@@ -1455,11 +1472,19 @@ class VegaProviderRunner(private val context: Context) {
                 val list = mutableListOf<VegaProvider>()
                 for (i in 0 until arr.length()) {
                     val item = arr.getJSONObject(i)
+                    val rawIcon = item.optString("icon", "").trim()
+                    val resolvedIcon = when {
+                        rawIcon.isBlank() -> ""
+                        rawIcon.startsWith("http://", ignoreCase = true) || rawIcon.startsWith("https://", ignoreCase = true) -> rawIcon
+                        rawIcon.startsWith("//") -> "https:$rawIcon"
+                        rawIcon.startsWith("/") -> "${repo.trimEnd('/')}$rawIcon"
+                        else -> "${repo.trimEnd('/')}/$rawIcon"
+                    }
                     list.add(VegaProvider(
                         display_name = item.optString("display_name", ""),
                         value = item.optString("value", ""),
                         version = item.optString("version", ""),
-                        icon = item.optString("icon", ""),
+                        icon = resolvedIcon,
                         type = item.optString("type", "global"),
                         disabled = item.optBoolean("disabled", false)
                     ))
@@ -1476,39 +1501,96 @@ class VegaProviderRunner(private val context: Context) {
         throw lastException ?: Exception("Failed to fetch manifest from all sources")
     }
 
-    suspend fun getCatalog(repoUrl: String, providerValue: String): Pair<List<VegaCatalog>, List<VegaCatalog>> {
-        loadScraper(repoUrl, providerValue)
+    private suspend fun getCatalogInternal(repoUrl: String, providerValue: String): Pair<List<VegaCatalog>, List<VegaCatalog>> {
+        loadScraperInternal(repoUrl, providerValue)
         val jsCode = """
-            let mod = (window.vegaModules['$providerValue'] || {})['catalog'] || {};
-            let catalogArr = mod.catalog || (mod.default && mod.default.catalog) || [];
-            let genresArr = mod.genres || (mod.default && mod.default.genres) || [];
-            window.AndroidBridge.onResult('__CALLBACK_ID__', JSON.stringify({ catalog: catalogArr, genres: genresArr }));
+            (async function() {
+                try {
+                    let mod = (window.vegaModules && window.vegaModules['$providerValue']) ? window.vegaModules['$providerValue']['catalog'] : null;
+                    mod = mod || {};
+                    let catalogArr = [];
+                    let genresArr = [];
+                    if (typeof mod === 'function') {
+                        catalogArr = await mod();
+                    } else if (mod.catalog) {
+                        catalogArr = typeof mod.catalog === 'function' ? await mod.catalog() : mod.catalog;
+                    } else if (mod.default) {
+                        if (typeof mod.default === 'function') {
+                            catalogArr = await mod.default();
+                        } else if (mod.default.catalog) {
+                            catalogArr = typeof mod.default.catalog === 'function' ? await mod.default.catalog() : mod.default.catalog;
+                        } else if (Array.isArray(mod.default)) {
+                            catalogArr = mod.default;
+                        }
+                    } else if (Array.isArray(mod)) {
+                        catalogArr = mod;
+                    }
+                    if (mod.genres) {
+                        genresArr = typeof mod.genres === 'function' ? await mod.genres() : mod.genres;
+                    } else if (mod.default && mod.default.genres) {
+                        genresArr = typeof mod.default.genres === 'function' ? await mod.default.genres() : mod.default.genres;
+                    }
+                    window.AndroidBridge.onResult('__CALLBACK_ID__', JSON.stringify({ catalog: catalogArr || [], genres: genresArr || [] }));
+                } catch(e) {
+                    console.error("getCatalog error:", e);
+                    window.AndroidBridge.onResult('__CALLBACK_ID__', JSON.stringify({ catalog: [], genres: [] }));
+                }
+            })();
         """.trimIndent()
         
         val jsonStr = evalJsAsync(jsCode)
         val obj = JSONObject(jsonStr)
-        val catalogArr = obj.getJSONArray("catalog")
-        val genresArr = obj.getJSONArray("genres")
+        val catalogArr = obj.optJSONArray("catalog") ?: JSONArray()
+        val genresArr = obj.optJSONArray("genres") ?: JSONArray()
         
         val catalog = mutableListOf<VegaCatalog>()
         for (i in 0 until catalogArr.length()) {
             val item = catalogArr.getJSONObject(i)
-            catalog.add(VegaCatalog(item.getString("title"), item.optString("filter", "")))
+            catalog.add(VegaCatalog(item.optString("title", ""), item.optString("filter", "")))
         }
         
         val genres = mutableListOf<VegaCatalog>()
         for (i in 0 until genresArr.length()) {
             val item = genresArr.getJSONObject(i)
-            genres.add(VegaCatalog(item.getString("title"), item.optString("filter", "")))
+            genres.add(VegaCatalog(item.optString("title", ""), item.optString("filter", "")))
         }
         
         return Pair(catalog, genres)
     }
 
-    suspend fun getPosts(repoUrl: String, providerValue: String, filter: String, page: Int): List<VegaPost> {
-        loadScraper(repoUrl, providerValue)
+    suspend fun getCatalog(repoUrl: String, providerValue: String): Pair<List<VegaCatalog>, List<VegaCatalog>> = runnerMutex.withLock {
+        getCatalogInternal(repoUrl, providerValue)
+    }
+
+    suspend fun getPosts(repoUrl: String, providerValue: String, filter: String, page: Int): List<VegaPost> = runnerMutex.withLock {
+        loadScraperInternal(repoUrl, providerValue)
+        var actualFilter = filter
+        if (actualFilter.isBlank()) {
+            try {
+                val cachedCats = MovieCacheStore.getInstance(context).getCategories(repoUrl, providerValue)
+                val cachedDefault = cachedCats?.firstOrNull()?.filter
+                if (!cachedDefault.isNullOrBlank()) {
+                    actualFilter = cachedDefault
+                } else {
+                    val (catalog, _) = getCatalogInternal(repoUrl, providerValue)
+                    val defaultFilter = catalog.firstOrNull()?.filter
+                    if (!defaultFilter.isNullOrBlank()) {
+                        actualFilter = defaultFilter
+                    }
+                }
+            } catch (e: Exception) {
+                Log.w(TAG, "Error resolving default catalog filter for $providerValue: ${e.message}")
+            }
+            if (actualFilter.isBlank()) {
+                actualFilter = when (providerValue) {
+                    "autoEmbed" -> "/top/catalog/movie/top.json"
+                    "kissKh" -> "/api/DramaList/List?type=0&sub=0&country=0&status=0&order=2"
+                    else -> ""
+                }
+            }
+        }
         // Escape single quotes in filter to prevent JS injection
-        val safeFilter = filter.replace("'", "\\'")
+        val safeFilter = actualFilter.replace("'", "\\'")
         val jsCode = """
             try {
                 if (!window.providerContext) {
@@ -1539,7 +1621,18 @@ class VegaProviderRunner(private val context: Context) {
                     window.AndroidBridge.onResult('__CALLBACK_ID__', '[]');
                     return;
                 }
-                const res = await fn({ filter: '$safeFilter', page: $page, provider: '$providerValue', providerValue: '$providerValue', providerContext: window.providerContext });
+                let resolvedFilter = '$safeFilter';
+                if (!resolvedFilter) {
+                    try {
+                        const catMod = (window.vegaModules && window.vegaModules['$providerValue']) ? window.vegaModules['$providerValue']['catalog'] : null;
+                        const catList = (catMod && (catMod.catalog || (catMod.default && catMod.default.catalog))) || [];
+                        if (Array.isArray(catList) && catList.length > 0 && catList[0] && catList[0].filter) {
+                            resolvedFilter = catList[0].filter;
+                        }
+                    } catch(e) {}
+                }
+                const localContext = Object.assign({}, window.providerContext || {}, { providerValue: '$providerValue' });
+                const res = await fn({ filter: resolvedFilter, page: $page, provider: '$providerValue', providerValue: '$providerValue', providerContext: localContext });
                 window.AndroidBridge.onResult('__CALLBACK_ID__', JSON.stringify(res || []));
             } catch(e) {
                 console.error("Error in getPosts:", e);
@@ -1558,12 +1651,12 @@ class VegaProviderRunner(private val context: Context) {
                 image = item.optString("image", "")
             ))
         }
-        return posts
+        posts
     }
 
-    suspend fun getSearchPosts(repoUrl: String, providerValue: String, query: String, page: Int): List<VegaPost> {
-        loadScraper(repoUrl, providerValue)
-        val safeQuery = query.replace("'", "\\'").replace("\\", "\\\\")
+    suspend fun getSearchPosts(repoUrl: String, providerValue: String, query: String, page: Int): List<VegaPost> = runnerMutex.withLock {
+        loadScraperInternal(repoUrl, providerValue)
+        val quotedQuery = JSONObject.quote(query)
         val jsCode = """
             try {
                 if (!window.providerContext) {
@@ -1571,17 +1664,29 @@ class VegaProviderRunner(private val context: Context) {
                 }
                 const mod = (window.vegaModules && window.vegaModules['$providerValue']) ? window.vegaModules['$providerValue']['posts'] : null;
                 let fn = null;
+                let isSearchPosts = true;
                 if (mod) {
                     if (typeof mod.getSearchPosts === 'function') {
                         fn = mod.getSearchPosts;
-                    } else if (mod.default && typeof mod.default === 'function') {
-                        fn = mod.default;
                     } else if (mod.default && typeof mod.default.getSearchPosts === 'function') {
                         fn = mod.default.getSearchPosts;
+                    } else if (typeof mod.getPosts === 'function') {
+                        fn = mod.getPosts;
+                        isSearchPosts = false;
+                    } else if (mod.default && typeof mod.default.getPosts === 'function') {
+                        fn = mod.default.getPosts;
+                        isSearchPosts = false;
+                    } else if (mod.default && typeof mod.default === 'function') {
+                        fn = mod.default;
                     }
                 }
                 if (fn) {
-                    const res = await fn({ searchQuery: '$safeQuery', page: $page, providerValue: '$providerValue', signal: null, providerContext: (window.providerContext || {}) });
+                    const localContext = Object.assign({}, window.providerContext || {}, { providerValue: '$providerValue' });
+                    const queryStr = $quotedQuery;
+                    const args = isSearchPosts
+                        ? { searchQuery: queryStr, page: $page, providerValue: '$providerValue', signal: null, providerContext: localContext }
+                        : { filter: queryStr, page: $page, providerValue: '$providerValue', signal: null, providerContext: localContext };
+                    const res = await fn(args);
                     window.AndroidBridge.onResult('__CALLBACK_ID__', JSON.stringify(res || []));
                 } else {
                     window.AndroidBridge.onResult('__CALLBACK_ID__', '[]');
@@ -1603,11 +1708,11 @@ class VegaProviderRunner(private val context: Context) {
                 image = item.optString("image", "")
             ))
         }
-        return posts
+        posts
     }
 
-    suspend fun getMeta(repoUrl: String, providerValue: String, link: String): VegaMeta {
-        loadScraper(repoUrl, providerValue)
+    suspend fun getMeta(repoUrl: String, providerValue: String, link: String): VegaMeta = runnerMutex.withLock {
+        loadScraperInternal(repoUrl, providerValue)
         val safeLink = link.replace("'", "\\'").replace("\\", "\\\\")
         val jsCode = """
             try {
@@ -1691,6 +1796,23 @@ class VegaProviderRunner(private val context: Context) {
                 val episodesLink = (item.optString("episodesLink", "").takeIf { it.isNotEmpty() }
                     ?: item.optString("link", "").takeIf { it.isNotEmpty() }
                     ?: item.optString("url", "").takeIf { it.isNotEmpty() })
+                val itemImage = (item.optString("image", "").takeIf { it.isNotEmpty() }
+                    ?: item.optString("thumbnail", "").takeIf { it.isNotEmpty() }
+                    ?: item.optString("poster", "").takeIf { it.isNotEmpty() }
+                    ?: item.optString("poster_path", "").takeIf { it.isNotEmpty() })
+                val itemDuration = (item.optString("duration", "").takeIf { it.isNotEmpty() }
+                    ?: item.optString("runtime", "").takeIf { it.isNotEmpty() }
+                    ?: item.optString("time", "").takeIf { it.isNotEmpty() })
+                val itemDate = (item.optString("date", "").takeIf { it.isNotEmpty() }
+                    ?: item.optString("releaseDate", "").takeIf { it.isNotEmpty() }
+                    ?: item.optString("airDate", "").takeIf { it.isNotEmpty() }
+                    ?: item.optString("aired", "").takeIf { it.isNotEmpty() })
+                val itemEp = (item.optString("episodeNumber", "").takeIf { it.isNotEmpty() }
+                    ?: item.optString("episode", "").takeIf { it.isNotEmpty() }
+                    ?: item.optString("ep", "").takeIf { it.isNotEmpty() }
+                    ?: item.optString("number", "").takeIf { it.isNotEmpty() })
+                val itemSeason = (item.optString("seasonNumber", "").takeIf { it.isNotEmpty() }
+                    ?: item.optString("season", "").takeIf { it.isNotEmpty() })
                 
                 var directLinks: MutableList<VegaDirectLink>? = null
                 if (item.has("directLinks") && !item.isNull("directLinks")) {
@@ -1698,14 +1820,43 @@ class VegaProviderRunner(private val context: Context) {
                     directLinks = mutableListOf()
                     for (j in 0 until dArr.length()) {
                         val dObj = dArr.getJSONObject(j)
+                        val dImage = (dObj.optString("image", "").takeIf { it.isNotEmpty() }
+                            ?: dObj.optString("thumbnail", "").takeIf { it.isNotEmpty() }
+                            ?: itemImage)
+                        val dDuration = (dObj.optString("duration", "").takeIf { it.isNotEmpty() }
+                            ?: dObj.optString("runtime", "").takeIf { it.isNotEmpty() }
+                            ?: itemDuration)
+                        val dDate = (dObj.optString("date", "").takeIf { it.isNotEmpty() }
+                            ?: dObj.optString("releaseDate", "").takeIf { it.isNotEmpty() }
+                            ?: itemDate)
+                        val dEp = (dObj.optString("episodeNumber", "").takeIf { it.isNotEmpty() }
+                            ?: dObj.optString("episode", "").takeIf { it.isNotEmpty() }
+                            ?: itemEp)
+                        val dSeason = (dObj.optString("seasonNumber", "").takeIf { it.isNotEmpty() }
+                            ?: dObj.optString("season", "").takeIf { it.isNotEmpty() }
+                            ?: itemSeason)
                         directLinks.add(VegaDirectLink(
                             title = cleanTitle(dObj.optString("title", "")),
                             link = dObj.optString("link", ""),
-                            type = dObj.optString("type", "")
+                            type = dObj.optString("type", ""),
+                            image = dImage,
+                            duration = dDuration,
+                            date = dDate,
+                            episodeNumber = dEp,
+                            seasonNumber = dSeason
                         ))
                     }
                 }
-                linkList.add(VegaLink(title, episodesLink, directLinks))
+                linkList.add(VegaLink(
+                    title = title,
+                    episodesLink = episodesLink,
+                    directLinks = directLinks,
+                    image = itemImage,
+                    duration = itemDuration,
+                    date = itemDate,
+                    episodeNumber = itemEp,
+                    seasonNumber = itemSeason
+                ))
             }
         }
         
@@ -1719,8 +1870,8 @@ class VegaProviderRunner(private val context: Context) {
         )
     }
 
-    suspend fun getStream(repoUrl: String, providerValue: String, link: String, type: String): List<VegaStream> {
-        loadScraper(repoUrl, providerValue)
+    suspend fun getStream(repoUrl: String, providerValue: String, link: String, type: String): List<VegaStream> = runnerMutex.withLock {
+        loadScraperInternal(repoUrl, providerValue)
         val safeLink = link.replace("'", "\\'").replace("\\", "\\\\")
         val safeType = type.replace("'", "\\'")
         val jsCode = """
@@ -1774,8 +1925,8 @@ class VegaProviderRunner(private val context: Context) {
         return streams
     }
 
-    suspend fun getEpisodes(repoUrl: String, providerValue: String, url: String): List<VegaLink> {
-        loadScraper(repoUrl, providerValue)
+    suspend fun getEpisodes(repoUrl: String, providerValue: String, url: String): List<VegaLink> = runnerMutex.withLock {
+        loadScraperInternal(repoUrl, providerValue)
         val safeUrl = url.replace("'", "\\'").replace("\\", "\\\\")
         val jsCode = """
             try {
@@ -1821,20 +1972,67 @@ class VegaProviderRunner(private val context: Context) {
                 ?: item.optString("link", "").takeIf { it.isNotEmpty() }
                 ?: item.optString("url", "").takeIf { it.isNotEmpty() })
             
+            val itemImage = (item.optString("image", "").takeIf { it.isNotEmpty() }
+                ?: item.optString("thumbnail", "").takeIf { it.isNotEmpty() }
+                ?: item.optString("poster", "").takeIf { it.isNotEmpty() }
+                ?: item.optString("poster_path", "").takeIf { it.isNotEmpty() })
+            val itemDuration = (item.optString("duration", "").takeIf { it.isNotEmpty() }
+                ?: item.optString("runtime", "").takeIf { it.isNotEmpty() }
+                ?: item.optString("time", "").takeIf { it.isNotEmpty() })
+            val itemDate = (item.optString("date", "").takeIf { it.isNotEmpty() }
+                ?: item.optString("releaseDate", "").takeIf { it.isNotEmpty() }
+                ?: item.optString("airDate", "").takeIf { it.isNotEmpty() }
+                ?: item.optString("aired", "").takeIf { it.isNotEmpty() })
+            val itemEp = (item.optString("episodeNumber", "").takeIf { it.isNotEmpty() }
+                ?: item.optString("episode", "").takeIf { it.isNotEmpty() }
+                ?: item.optString("ep", "").takeIf { it.isNotEmpty() }
+                ?: item.optString("number", "").takeIf { it.isNotEmpty() })
+            val itemSeason = (item.optString("seasonNumber", "").takeIf { it.isNotEmpty() }
+                ?: item.optString("season", "").takeIf { it.isNotEmpty() })
+
             var directLinks: MutableList<VegaDirectLink>? = null
             if (item.has("directLinks") && !item.isNull("directLinks")) {
                 val dArr = item.getJSONArray("directLinks")
                 directLinks = mutableListOf()
                 for (j in 0 until dArr.length()) {
                     val dObj = dArr.getJSONObject(j)
+                    val dImage = (dObj.optString("image", "").takeIf { it.isNotEmpty() }
+                        ?: dObj.optString("thumbnail", "").takeIf { it.isNotEmpty() }
+                        ?: itemImage)
+                    val dDuration = (dObj.optString("duration", "").takeIf { it.isNotEmpty() }
+                        ?: dObj.optString("runtime", "").takeIf { it.isNotEmpty() }
+                        ?: itemDuration)
+                    val dDate = (dObj.optString("date", "").takeIf { it.isNotEmpty() }
+                        ?: dObj.optString("releaseDate", "").takeIf { it.isNotEmpty() }
+                        ?: itemDate)
+                    val dEp = (dObj.optString("episodeNumber", "").takeIf { it.isNotEmpty() }
+                        ?: dObj.optString("episode", "").takeIf { it.isNotEmpty() }
+                        ?: itemEp)
+                    val dSeason = (dObj.optString("seasonNumber", "").takeIf { it.isNotEmpty() }
+                        ?: dObj.optString("season", "").takeIf { it.isNotEmpty() }
+                        ?: itemSeason)
                     directLinks.add(VegaDirectLink(
                         title = cleanTitle(dObj.optString("title", "")),
                         link = dObj.optString("link", ""),
-                        type = dObj.optString("type", "")
+                        type = dObj.optString("type", ""),
+                        image = dImage,
+                        duration = dDuration,
+                        date = dDate,
+                        episodeNumber = dEp,
+                        seasonNumber = dSeason
                     ))
                 }
             }
-            links.add(VegaLink(title, episodesLink, directLinks))
+            links.add(VegaLink(
+                title = title,
+                episodesLink = episodesLink,
+                directLinks = directLinks,
+                image = itemImage,
+                duration = itemDuration,
+                date = itemDate,
+                episodeNumber = itemEp,
+                seasonNumber = itemSeason
+            ))
         }
         return links
     }
@@ -1842,10 +2040,19 @@ class VegaProviderRunner(private val context: Context) {
     fun destroy() {
         mainHandler.post {
             webView?.let { oldWebView ->
+                // BUG-019 fix: separate try/catch blocks so destroy() always runs even if clearCache throws
                 try {
                     oldWebView.stopLoading()
                     oldWebView.clearHistory()
+                } catch (e: Exception) {
+                    Log.w(TAG, "Error stopping/clearing WebView history: ${e.message}")
+                }
+                try {
                     oldWebView.clearCache(true)
+                } catch (e: Exception) {
+                    Log.w(TAG, "Error clearing WebView cache: ${e.message}")
+                }
+                try {
                     oldWebView.loadUrl("about:blank")
                     oldWebView.onPause()
                     oldWebView.destroy()
@@ -1862,7 +2069,7 @@ class VegaProviderRunner(private val context: Context) {
 
     inner class AndroidBridge {
         private val callbacks = java.util.concurrent.ConcurrentHashMap<String, CompletableDeferred<String>>()
-        private var callbackIdCounter = 0
+        private val callbackIdCounter = java.util.concurrent.atomic.AtomicLong(0)
 
         fun clearPendingCallbacks() {
             callbacks.values.forEach { deferred ->
@@ -1873,8 +2080,12 @@ class VegaProviderRunner(private val context: Context) {
             callbacks.clear()
         }
 
+        fun removeCallback(callbackId: String): CompletableDeferred<String>? {
+            return callbacks.remove(callbackId)
+        }
+
         fun registerCallback(deferred: CompletableDeferred<String>): String {
-            val id = "cb_${++callbackIdCounter}"
+            val id = "cb_${callbackIdCounter.incrementAndGet()}"
             callbacks[id] = deferred
             return id
         }
@@ -2216,6 +2427,32 @@ class VegaProviderRunner(private val context: Context) {
         patched = patched.replace("catch(err){throwProviderError(\"Torrentio\",\"metadata\",err)}", fallbackBlock)
         patched = patched.replace("catch(err){throwProviderError(\"Everything\",\"metadata\",err)}", fallbackBlock)
 
+        return patched
+    }
+
+    private fun patchKissKhPostsJs(js: String): String {
+        var patched = js
+        // 1. Ensure page argument is received from caller
+        patched = patched.replace(
+            "{filter:filter,signal:signal,providerContext:providerContext}",
+            "{filter:filter,page:page,signal:signal,providerContext:providerContext}"
+        )
+        // 2. Build clean URL with filter fallback, pageSize=100, and page pagination
+        patched = patched.replace(
+            "url=`\${baseUrl+filter}&type=0`",
+            """url=((baseUrl, filter, page) => {
+                let f = (filter && filter.trim()) || '/api/DramaList/List?type=0&sub=0&country=0&status=0&order=2';
+                if (!f.startsWith('/')) f = '/' + f;
+                const p = (typeof page !== 'undefined' && page && page > 1) ? page : 1;
+                const sep = f.includes('?') ? '&' : '?';
+                return `${'$'}{baseUrl}${'$'}{f}${'$'}{sep}pageSize=100&page=${'$'}{p}&type=0`;
+            })(baseUrl, filter, typeof page !== 'undefined' ? page : 1)""".trimIndent()
+        )
+        // 3. Fallback simple replace if obfuscated differently
+        patched = patched.replace(
+            "baseUrl+filter",
+            "baseUrl + (filter || '/api/DramaList/List?type=0&sub=0&country=0&status=0&order=2')"
+        )
         return patched
     }
 }

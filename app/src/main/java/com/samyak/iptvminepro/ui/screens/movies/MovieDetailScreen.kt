@@ -172,7 +172,9 @@ fun MovieDetailScreen(
             resolvingStream = true
             try {
                 val resolveType = getResolveType(directLink.type)
-                val streams = runner.getStream(providerUrl, scraperValue, directLink.link, resolveType).filter { it.link.isNotBlank() }
+                val streams = com.samyak.iptvminepro.model.prioritizeStreams(
+                    runner.getStream(providerUrl, scraperValue, directLink.link, resolveType).filter { it.link.isNotBlank() }
+                )
                 if (streams.isEmpty()) {
                     Toast.makeText(context, "No stream links found", Toast.LENGTH_SHORT).show()
                 } else {
@@ -213,7 +215,9 @@ fun MovieDetailScreen(
             resolvingStream = true
             try {
                 val resolveType = getResolveType(directLink.type)
-                val streams = runner.getStream(providerUrl, scraperValue, directLink.link, resolveType).filter { it.link.isNotBlank() }
+                val streams = com.samyak.iptvminepro.model.prioritizeStreams(
+                    runner.getStream(providerUrl, scraperValue, directLink.link, resolveType).filter { it.link.isNotBlank() }
+                )
                 if (streams.isEmpty()) {
                     Toast.makeText(context, "No stream links found", Toast.LENGTH_SHORT).show()
                 } else if (streams.size == 1) {
@@ -245,8 +249,9 @@ fun MovieDetailScreen(
             streamResolutionJob = scope.launch {
                 resolvingStream = true
                 try {
-                    val streams = runner.getStream(providerUrl, scraperValue, item.link, item.type)
-                        .filter { it.link.isNotBlank() }
+                    val streams = com.samyak.iptvminepro.model.prioritizeStreams(
+                        runner.getStream(providerUrl, scraperValue, item.link, item.type).filter { it.link.isNotBlank() }
+                    )
                     if (streams.isEmpty()) {
                         Toast.makeText(context, "No stream links found", Toast.LENGTH_SHORT).show()
                     } else {
@@ -571,8 +576,18 @@ fun MovieDetailScreen(
                         .padding(horizontal = 16.dp)
                         .offset(y = (-44).dp)
                 ) {
+                    val isSeries = movieMeta.type.equals("series", ignoreCase = true) ||
+                        movieMeta.linkList.any { it.episodesLink != null } ||
+                        movieMeta.linkList.any { link ->
+                            link.directLinks?.any { dl ->
+                                dl.title.contains("episode", ignoreCase = true) ||
+                                dl.title.contains("ep ", ignoreCase = true) ||
+                                Regex("(?i)\\bep?\\s*\\d{1,3}\\b").containsMatchIn(dl.title)
+                            } == true
+                        }
+
                     Text(
-                        text = if (movieMeta.type.lowercase() == "series") "Seasons & Episodes" else "Stream / Download Options",
+                        text = if (isSeries) "Seasons & Episodes" else "Stream / Download Options",
                         fontSize = 16.sp,
                         fontWeight = FontWeight.Bold,
                         color = Color.White
@@ -748,7 +763,9 @@ fun MovieDetailScreen(
                                                                                             streamResolutionJob = scope.launch {
                                                                                                 resolvingStream = true
                                                                                                 try {
-                                                                                                    val streams = runner.getStream(providerUrl, scraperValue, episodeLink.episodesLink!!, getResolveType("series")).filter { it.link.isNotBlank() }
+                                                                                                    val streams = com.samyak.iptvminepro.model.prioritizeStreams(
+                                                                                                        runner.getStream(providerUrl, scraperValue, episodeLink.episodesLink!!, getResolveType("series")).filter { it.link.isNotBlank() }
+                                                                                                    )
                                                                                                     if (streams.isEmpty()) {
                                                                                                         Toast.makeText(context, "No stream links found", Toast.LENGTH_SHORT).show()
                                                                                                     } else if (streams.size == 1) {

@@ -26,14 +26,19 @@ import com.samyak.iptvminepro.R
 import com.samyak.iptvminepro.provider.ChannelsProvider
 import com.samyak.iptvminepro.ui.components.ChannelCard
 
+import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.Add
+
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun TelevisionScreen(
     viewModel: ChannelsProvider = viewModel(),
     searchQuery: String = "",
-    onChannelClick: (com.samyak.iptvminepro.model.Channel) -> Unit
+    onChannelClick: (com.samyak.iptvminepro.model.Channel) -> Unit,
+    onAddProviderClick: (() -> Unit)? = null
 ) {
     val channels by viewModel.filteredChannels.observeAsState(emptyList())
+    val allChannels by viewModel.channels.observeAsState(emptyList())
     val categories by viewModel.categories.observeAsState(emptyList())
     val isLoading by viewModel.isLoading.observeAsState(false)
     val errorMessage by viewModel.error.observeAsState(null)
@@ -44,7 +49,7 @@ fun TelevisionScreen(
         viewModel.loadIfNeeded()
     }
 
-    LaunchedEffect(searchQuery, selectedCategory) {
+    LaunchedEffect(searchQuery, selectedCategory, allChannels) {
         viewModel.filterChannelsByQueryAndCategory(searchQuery, selectedCategory)
     }
 
@@ -117,6 +122,20 @@ fun TelevisionScreen(
                         textAlign = androidx.compose.ui.text.style.TextAlign.Center,
                         fontSize = 14.sp
                     )
+                    if (onAddProviderClick != null) {
+                        Spacer(modifier = Modifier.height(16.dp))
+                        Button(
+                            onClick = onAddProviderClick,
+                            colors = ButtonDefaults.buttonColors(
+                                containerColor = MaterialTheme.colorScheme.primary
+                            ),
+                            shape = RoundedCornerShape(12.dp)
+                        ) {
+                            Icon(Icons.Default.Add, contentDescription = null, modifier = Modifier.size(18.dp))
+                            Spacer(modifier = Modifier.width(8.dp))
+                            Text("Add Provider")
+                        }
+                    }
                 }
             } else if (channels.isEmpty()) {
                 Column(
@@ -138,6 +157,20 @@ fun TelevisionScreen(
                         textAlign = androidx.compose.ui.text.style.TextAlign.Center,
                         fontSize = 16.sp
                     )
+                    if (onAddProviderClick != null) {
+                        Spacer(modifier = Modifier.height(16.dp))
+                        Button(
+                            onClick = onAddProviderClick,
+                            colors = ButtonDefaults.buttonColors(
+                                containerColor = MaterialTheme.colorScheme.primary
+                            ),
+                            shape = RoundedCornerShape(12.dp)
+                        ) {
+                            Icon(Icons.Default.Add, contentDescription = null, modifier = Modifier.size(18.dp))
+                            Spacer(modifier = Modifier.width(8.dp))
+                            Text("Add Provider")
+                        }
+                    }
                 }
             } else {
                 LazyVerticalGrid(

@@ -1454,16 +1454,19 @@ class PlayerActivity : AppCompatActivity() {
                 if (isFinishing || isDestroyed) return@runOnUiThread
                 Log.d(TAG, "Content probe result: $result")
                 if (result == ProbeResult.HTML) {
+                    Log.w(TAG, "Content probe detected non-media / limit page. Trying next stream candidate...")
                     if (tryNextStreamCandidate()) return@runOnUiThread
-                    showError("This link isn't a playable video. The server returned a web page, so the stream may be expired, geo-blocked, or require sign-in.")
+                    showError("This link is not a playable video. The server returned an error, daily limit reached, or stream expired. Try another source.")
                     return@runOnUiThread
                 }
 
                 // If host is completely unreachable during probe, try next candidate immediately
                 val isHostUnreachable = probeException is java.net.UnknownHostException ||
                     probeException is java.net.ConnectException ||
+                    probeException is java.net.SocketTimeoutException ||
                     probeException?.message?.contains("Unable to resolve host", ignoreCase = true) == true ||
-                    probeException?.message?.contains("Failed to connect", ignoreCase = true) == true
+                    probeException?.message?.contains("Failed to connect", ignoreCase = true) == true ||
+                    probeException?.message?.contains("timeout", ignoreCase = true) == true
 
                 if (isHostUnreachable) {
                     Log.w(TAG, "Host unreachable during probe (${probeException?.message}), trying next candidate...")
@@ -1539,8 +1542,23 @@ class PlayerActivity : AppCompatActivity() {
                     buf[6] == 'y'.code.toByte() && buf[7] == 'p'.code.toByte()) return ProbeResult.MP4
             }
 
+            val isLimitOrErrorPayload = headLower.contains("daily_limit_exceeded") ||
+                headLower.contains("daily limit") ||
+                headLower.contains("limit exceeded") ||
+                headLower.contains("download limit") ||
+                headLower.contains("too many requests") ||
+                headLower.contains("rate limit") ||
+                headLower.contains("quota exceeded") ||
+                headLower.contains("bandwidth limit") ||
+                (contentType.contains("json") && headLower.contains("\"message\"") && (headLower.contains("limit") || headLower.contains("error")))
+
+            if (isLimitOrErrorPayload || status == 429 || status == 509) {
+                Log.w(TAG, "Probe detected rate limit or non-media error response (status: $status). Marking as unplayable.")
+                return ProbeResult.HTML
+            }
+
             if (status >= 400 &&
-                (headLower.startsWith("<!doctype html") || headLower.startsWith("<html") || contentType.startsWith("text/"))) {
+                (headLower.startsWith("<!doctype html") || headLower.startsWith("<html") || contentType.startsWith("text/") || contentType.contains("json") || isLimitOrErrorPayload)) {
                 return ProbeResult.HTML
             }
             return ProbeResult.UNKNOWN
@@ -1732,14 +1750,20 @@ class PlayerActivity : AppCompatActivity() {
                 error.cause is java.net.NoRouteToHostException ||
                 error.cause?.message?.contains("Unable to resolve host", ignoreCase = true) == true
 
-        val isHttpServerError = error.errorCode == PlaybackException.ERROR_CODE_IO_BAD_HTTP_STATUS &&
-                run {
-                    val code = (error.cause as? androidx.media3.datasource.HttpDataSource.InvalidResponseCodeException)?.responseCode ?: -1
-                    code in listOf(404, 410, 500, 502, 503, 520, 521, 522, 523, 524)
-                }
+        val httpCode = (error.cause as? androidx.media3.datasource.HttpDataSource.InvalidResponseCodeException)?.responseCode ?: -1
+        val isRateLimit = httpCode == 429 || httpCode == 509 ||
+            error.message?.contains("429", ignoreCase = true) == true ||
+            error.cause?.message?.contains("429", ignoreCase = true) == true ||
+            error.cause?.message?.contains("limit", ignoreCase = true) == true ||
+            error.cause?.message?.contains("quota", ignoreCase = true) == true ||
+            error.cause?.message?.contains("bandwidth", ignoreCase = true) == true
+
+        val isHttpServerError = (error.errorCode == PlaybackException.ERROR_CODE_IO_BAD_HTTP_STATUS && httpCode != 401 && httpCode != 403) ||
+            isRateLimit ||
+            (httpCode in listOf(400, 404, 408, 410, 429, 500, 502, 503, 504, 509, 520, 521, 522, 523, 524))
 
         if (isNetworkOrHostError || isHttpServerError) {
-            Log.w(TAG, "Stream failed with network/server error (${error.errorCodeName}: ${error.cause?.message}). Attempting next candidate...")
+            Log.w(TAG, "Stream failed with network/server error (${error.errorCodeName}: ${error.cause?.message}, HTTP $httpCode). Attempting next candidate...")
             if (tryNextStreamCandidate()) return
         }
 

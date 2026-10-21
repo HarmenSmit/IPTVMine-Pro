@@ -85,16 +85,25 @@ object DownloadManager {
 
     @Synchronized
     private fun saveTasks() {
-        try {
-            val file = File(appContext.filesDir, FILE_NAME)
-            val json = gson.toJson(_downloadTasks.value)
-            file.writeText(json)
-        } catch (e: Exception) {
-            e.printStackTrace()
+        // BUG-012 fix: dispatch file I/O to IO dispatcher to avoid StrictMode violations
+        // when called from the main thread (e.g. cancelTask/deleteTask)
+        scope.launch(Dispatchers.IO) {
+            try {
+                val file = File(appContext.filesDir, FILE_NAME)
+                val json = gson.toJson(_downloadTasks.value)
+                file.writeText(json)
+            } catch (e: Exception) {
+                e.printStackTrace()
+            }
         }
     }
 
     fun download(title: String, downloadUrl: String, headers: Map<String, String>? = null) {
+        // BUG-003 fix: guard against access before init(context) is called
+        if (!::appContext.isInitialized) {
+            android.util.Log.w("DownloadManager", "download() called before init() — ignoring")
+            return
+        }
         val cleanedTitle = cleanTitle(title)
         val extension = downloadUrl.substringAfterLast('.', "").substringBefore('?').lowercase().let {
             if (it.isEmpty() || it.length > 5) "mp4" else it
@@ -243,6 +252,8 @@ object DownloadManager {
     }
 
     private fun updateTaskProgress(id: String, progress: Float, downloaded: Long, total: Long, speed: String) {
+        // BUG-022 fix: update in-memory state only — no disk write on every progress tick.
+        // saveTasks() is called only on status changes (COMPLETED, FAILED, CANCELLED).
         _downloadTasks.value = _downloadTasks.value.map {
             if (it.id == id) {
                 it.copy(
@@ -256,19 +267,25 @@ object DownloadManager {
     }
 
     fun cancelTask(id: String) {
+        // BUG-003 fix: guard against access before init(context) is called
+        if (!::appContext.isInitialized) return
         val task = _downloadTasks.value.find { id == it.id } ?: return
-        val pathOrUri = task.savePath
-        if (pathOrUri.startsWith("content://")) {
-            try {
-                val uri = Uri.parse(pathOrUri)
-                appContext.contentResolver.delete(uri, null, null)
-            } catch (e: Exception) {
-                e.printStackTrace()
-            }
-        } else {
-            val file = File(pathOrUri)
-            if (file.exists()) {
-                file.delete()
+        // BUG-020 fix: only delete the file if the download is still in-progress.
+        // Do NOT delete COMPLETED downloads here — use deleteTask() for that.
+        if (task.status == DownloadStatus.DOWNLOADING || task.status == DownloadStatus.PENDING) {
+            val pathOrUri = task.savePath
+            if (pathOrUri.startsWith("content://")) {
+                try {
+                    val uri = Uri.parse(pathOrUri)
+                    appContext.contentResolver.delete(uri, null, null)
+                } catch (e: Exception) {
+                    e.printStackTrace()
+                }
+            } else {
+                val file = File(pathOrUri)
+                if (file.exists()) {
+                    file.delete()
+                }
             }
         }
         _downloadTasks.value = _downloadTasks.value.filter { it.id != id }
@@ -277,6 +294,8 @@ object DownloadManager {
     }
 
     fun deleteTask(id: String) {
+        // BUG-003 fix: guard against access before init(context) is called
+        if (!::appContext.isInitialized) return
         val task = _downloadTasks.value.find { id == it.id } ?: return
         val pathOrUri = task.savePath
         if (pathOrUri.startsWith("content://")) {
@@ -297,8 +316,9 @@ object DownloadManager {
     }
 
     fun retryTask(id: String) {
-        val task = _downloadTasks.value.find { it.id == id } ?: return
-        if (task.status != DownloadStatus.FAILED) return
+        // BUG-003 fix: guard against access before init(context) is called
+        if (!::appContext.isInitialized) return
+        if (_downloadTasks.value.find { it.id == id }?.status != DownloadStatus.FAILED) return
 
         _downloadTasks.value = _downloadTasks.value.map {
             if (it.id == id) {
@@ -309,7 +329,9 @@ object DownloadManager {
         startServiceIfRunning()
 
         scope.launch {
-            runTask(task)
+            // BUG-011 fix: use a fresh lookup at the point of launch to avoid stale reference
+            val freshTask = _downloadTasks.value.find { it.id == id } ?: return@launch
+            runTask(freshTask)
         }
     }
 

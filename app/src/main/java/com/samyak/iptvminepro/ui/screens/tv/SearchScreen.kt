@@ -8,7 +8,7 @@ import androidx.compose.foundation.lazy.grid.LazyVerticalGrid
 import androidx.compose.foundation.lazy.grid.items
 import androidx.compose.foundation.lazy.items
 import androidx.compose.material.icons.Icons
-import androidx.compose.material.icons.filled.ArrowBack
+import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material.icons.filled.Clear
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
@@ -33,6 +33,7 @@ fun SearchScreen(
     onBack: () -> Unit = {}
 ) {
     val channels by viewModel.filteredChannels.observeAsState(emptyList())
+    val allChannels by viewModel.channels.observeAsState(emptyList())
     val categories by viewModel.categories.observeAsState(emptyList())
     val isLoading by viewModel.isLoading.observeAsState(false)
     val errorMessage by viewModel.error.observeAsState(null)
@@ -51,38 +52,44 @@ fun SearchScreen(
         viewModel.loadIfNeeded()
     }
 
+    LaunchedEffect(searchQuery, selectedCategory, allChannels) {
+        viewModel.filterChannelsByQueryAndCategory(searchQuery, selectedCategory)
+    }
+
     Scaffold(
         topBar = {
             TopAppBar(
                 title = {
                     TextField(
                         value = searchQuery,
-                        onValueChange = { 
-                            searchQuery = it
-                            viewModel.filterChannelsByQueryAndCategory(searchQuery, selectedCategory)
-                        },
+                        onValueChange = { searchQuery = it },
                         modifier = Modifier.fillMaxWidth(),
-                        placeholder = { Text(stringResource(id = R.string.placeholder_search_channels)) },
+                        placeholder = { 
+                            Text(
+                                text = stringResource(id = R.string.placeholder_search_channels),
+                                color = Color.White.copy(alpha = 0.7f)
+                            ) 
+                        },
                         colors = TextFieldDefaults.colors(
                             focusedContainerColor = Color.Transparent,
                             unfocusedContainerColor = Color.Transparent,
                             focusedIndicatorColor = Color.Transparent,
-                            unfocusedIndicatorColor = Color.Transparent
+                            unfocusedIndicatorColor = Color.Transparent,
+                            focusedTextColor = Color.White,
+                            unfocusedTextColor = Color.White,
+                            cursorColor = Color.White
                         ),
                         singleLine = true
                     )
                 },
                 navigationIcon = {
                     IconButton(onClick = onBack) {
-                        Icon(Icons.Default.ArrowBack, contentDescription = stringResource(id = R.string.desc_back))
+                        Icon(Icons.AutoMirrored.Filled.ArrowBack, contentDescription = stringResource(id = R.string.desc_back))
                     }
                 },
                 actions = {
                     if (searchQuery.isNotEmpty()) {
-                        IconButton(onClick = { 
-                            searchQuery = ""
-                            viewModel.filterChannelsByQueryAndCategory("", selectedCategory)
-                        }) {
+                        IconButton(onClick = { searchQuery = "" }) {
                             Icon(Icons.Default.Clear, contentDescription = stringResource(id = R.string.desc_clear))
                         }
                     }

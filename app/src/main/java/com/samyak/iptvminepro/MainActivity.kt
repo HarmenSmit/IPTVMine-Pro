@@ -112,6 +112,8 @@ import androidx.compose.material3.MaterialTheme
 import com.psoffritti.taptargetcompose.TapTargetCoordinator
 import com.psoffritti.taptargetcompose.TapTargetStyle
 import com.psoffritti.taptargetcompose.TextDefinition
+import androidx.compose.runtime.livedata.observeAsState
+import com.samyak.iptvminepro.model.ProviderType
 
 
 class MainActivity : ComponentActivity() {
@@ -213,15 +215,55 @@ fun MainApp() {
     val msgStillOffline = stringResource(id = R.string.msg_still_offline)
 
     var onWatchHistoryClearClick by remember { mutableStateOf<(() -> Unit)?>(null) }
-    val items = listOf(
-        Screen.Home,
-        Screen.Television,
-        Screen.Movies,
-        Screen.Category,
-        Screen.Settings
-    )
     val repository = remember { com.samyak.iptvminepro.provider.ProviderRepository(context) }
     val channelsViewModel: com.samyak.iptvminepro.provider.ChannelsProvider = viewModel()
+    val channels by channelsViewModel.channels.observeAsState(emptyList())
+    val providers by channelsViewModel.providers.observeAsState(repository.getProviders())
+    val isLoadingChannels by channelsViewModel.isLoading.observeAsState(false)
+
+    LaunchedEffect(Unit) {
+        channelsViewModel.loadIfNeeded()
+    }
+
+    val hasActiveIptvProvider = remember(providers) {
+        providers.any { it.isActive && it.safeType == ProviderType.IPTV }
+    }
+
+    val hasTvChannels = remember(channels, providers, isLoadingChannels, hasActiveIptvProvider) {
+        if (!hasActiveIptvProvider) {
+            false
+        } else if (channels.isNotEmpty()) {
+            true
+        } else if (isLoadingChannels) {
+            providers.any { it.isActive && it.safeType == ProviderType.IPTV && it.channelCount > 0 }
+        } else {
+            false
+        }
+    }
+
+    val items = remember(hasTvChannels) {
+        buildList {
+            add(Screen.Home)
+            if (hasTvChannels) {
+                add(Screen.Television)
+            }
+            add(Screen.Movies)
+            add(Screen.Category)
+            add(Screen.Settings)
+        }
+    }
+
+    LaunchedEffect(hasTvChannels, currentRoute) {
+        if (!hasTvChannels && currentRoute == Screen.Television.route) {
+            navController.navigate(Screen.Home.route) {
+                popUpTo(navController.graph.findStartDestination().id) {
+                    saveState = true
+                }
+                launchSingleTop = true
+            }
+        }
+    }
+
     // Activity-scoped: survives ALL navigation including back from MovieDetail
     val moviesViewModel: MoviesViewModel = viewModel()
     val homeViewModel: HomeViewModel = viewModel()
@@ -604,7 +646,8 @@ fun MainApp() {
                         } else {
                             com.samyak.player.PlayerActivity.start(context, channel.name, channel.streamUrl)
                         }
-                    }
+                    },
+                    onAddProviderClick = { navController.navigate(Screen.AddProvider.route) }
                 )
             }
             composable(

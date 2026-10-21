@@ -163,12 +163,7 @@ fun MoviesScreen(
             }
 
             // Scraper tabs
-            if (isScrapersLoading) {
-                LinearProgressIndicator(
-                    modifier = Modifier.fillMaxWidth().height(2.dp),
-                    color = Color(0xFF26A69A)
-                )
-            } else if (scrapers.isNotEmpty()) {
+            if (scrapers.isNotEmpty()) {
                 LazyRow(
                     modifier = Modifier
                         .fillMaxWidth()
@@ -192,6 +187,11 @@ fun MoviesScreen(
                         )
                     }
                 }
+            } else if (isScrapersLoading) {
+                LinearProgressIndicator(
+                    modifier = Modifier.fillMaxWidth().height(2.dp),
+                    color = Color(0xFF26A69A)
+                )
             }
 
             // Category tabs (only when search is empty)

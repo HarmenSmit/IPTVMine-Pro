@@ -6,6 +6,7 @@ import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import com.samyak.iptvminepro.model.*
 import com.samyak.iptvminepro.provider.ExtensionRepository
+import com.samyak.iptvminepro.provider.MovieCacheStore
 import com.samyak.iptvminepro.provider.ProviderRepository
 import com.samyak.iptvminepro.provider.VegaProviderRunner
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -19,6 +20,7 @@ class MoviesViewModel(application: Application) : AndroidViewModel(application) 
     private val repository = ProviderRepository(context)
     private val runner = VegaProviderRunner(context)
     private val extensionRepo = ExtensionRepository.getInstance(context)
+    private val cacheStore = MovieCacheStore.getInstance(context)
 
     override fun onCleared() {
         super.onCleared()
@@ -123,11 +125,48 @@ class MoviesViewModel(application: Application) : AndroidViewModel(application) 
         if (_selectedProvider.value == null && activeProviders.isNotEmpty()) {
             _selectedProvider.value = activeProviders.firstOrNull()
         }
-        if (_movies.value.isNotEmpty() && _categories.value.isNotEmpty()) return  // Primary: cached data → no API call on back-nav
-        if (dataLoaded) return                   // Secondary: load already triggered
-        dataLoaded = true
+        val provider = _selectedProvider.value
         val installed = extensionRepo.installedExtensionsFlow.value
-        lastInstalledExtensions = installed      // Record for change detection
+
+        // Immediate Cache Memory Store Restore (0ms!)
+        if (provider != null) {
+            val cachedScrapers = cacheStore.getScrapers(provider.url)?.filter { it.value in installed }
+            if (!cachedScrapers.isNullOrEmpty() && _scrapers.value.isEmpty()) {
+                _scrapers.value = cachedScrapers
+                val firstScraper = cachedScrapers.first()
+                if (_selectedScraper.value == null) {
+                    _selectedScraper.value = firstScraper
+                }
+                val cachedCats = cacheStore.getCategories(provider.url, firstScraper.value)
+                if (!cachedCats.isNullOrEmpty() && _categories.value.isEmpty()) {
+                    _categories.value = cachedCats
+                    val targetCat = if (initialCategoryTitle != null) {
+                        cachedCats.find { it.title == initialCategoryTitle } ?: cachedCats.first()
+                    } else {
+                        cachedCats.first()
+                    }
+                    _selectedCategory.value = targetCat
+                    val cachedPosts = cacheStore.getMovies(provider.url, firstScraper.value, targetCat.filter)
+                    if (!cachedPosts.isNullOrEmpty() && _movies.value.isEmpty()) {
+                        _movies.value = cachedPosts
+                        _isLoading.value = false
+                    }
+                }
+            }
+        }
+
+        if (_movies.value.isNotEmpty() && _categories.value.isNotEmpty()) {
+            if (!dataLoaded) {
+                dataLoaded = true
+                viewModelScope.launch {
+                    loadScrapers(installed = installed, initialCategoryTitle = initialCategoryTitle)
+                }
+            }
+            return
+        }
+        if (dataLoaded) return
+        dataLoaded = true
+        lastInstalledExtensions = installed
         viewModelScope.launch {
             loadScrapers(
                 installed = installed,
@@ -148,12 +187,41 @@ class MoviesViewModel(application: Application) : AndroidViewModel(application) 
         if (_selectedScraper.value?.value == scraper.value) return
         _selectedScraper.value = scraper
         _searchQuery.value = ""
+
+        // Instant Cache Memory lookup: populate categories and movies immediately
+        val provider = _selectedProvider.value
+        if (provider != null) {
+            val cachedCats = cacheStore.getCategories(provider.url, scraper.value)
+            if (!cachedCats.isNullOrEmpty()) {
+                _categories.value = cachedCats
+                val targetCat = cachedCats.firstOrNull()
+                _selectedCategory.value = targetCat
+                if (targetCat != null) {
+                    val cachedMovies = cacheStore.getMovies(provider.url, scraper.value, targetCat.filter)
+                    if (!cachedMovies.isNullOrEmpty()) {
+                        _movies.value = cachedMovies
+                        _isLoading.value = false
+                    }
+                }
+            }
+        }
         loadCatalogAndMovies()
     }
 
     fun selectCategory(category: VegaCatalog) {
         if (_selectedCategory.value?.filter == category.filter) return
         _selectedCategory.value = category
+
+        // Instant Cache Memory lookup for category filter
+        val provider = _selectedProvider.value
+        val scraper = _selectedScraper.value
+        if (provider != null && scraper != null) {
+            val cachedMovies = cacheStore.getMovies(provider.url, scraper.value, category.filter)
+            if (!cachedMovies.isNullOrEmpty()) {
+                _movies.value = cachedMovies
+                _isLoading.value = false
+            }
+        }
         loadMovies(isNextPage = false)
     }
 
@@ -176,24 +244,37 @@ class MoviesViewModel(application: Application) : AndroidViewModel(application) 
         if (_isLoading.value) return
 
         viewModelScope.launch {
-            _isLoading.value = true
+            val filter = _selectedCategory.value?.filter ?: ""
             if (!isNextPage) {
                 _page.value = 1
-                _movies.value = emptyList()
+                val cached = if (_searchQuery.value.isBlank()) cacheStore.getMovies(provider.url, scraper.value, filter) else null
+                if (!cached.isNullOrEmpty()) {
+                    _movies.value = cached
+                    _isLoading.value = false
+                } else if (_movies.value.isEmpty()) {
+                    _isLoading.value = true
+                }
                 _hasMore.value = true
+            } else {
+                _isLoading.value = true
             }
             try {
                 val newMovies = if (_searchQuery.value.isNotBlank()) {
                     runner.getSearchPosts(provider.url, scraper.value, _searchQuery.value.trim(), _page.value)
                 } else {
-                    val filter = _selectedCategory.value?.filter ?: ""
                     runner.getPosts(provider.url, scraper.value, filter, _page.value)
                 }
                 if (newMovies.isEmpty()) {
+                    if (!isNextPage && _movies.value.isEmpty()) {
+                        _movies.value = emptyList()
+                    }
                     _hasMore.value = false
                 } else {
                     _movies.value = if (isNextPage) _movies.value + newMovies else newMovies
                     _page.value++
+                    if (!isNextPage && _searchQuery.value.isBlank()) {
+                        cacheStore.putMovies(provider.url, scraper.value, filter, newMovies)
+                    }
                 }
             } catch (e: kotlinx.coroutines.CancellationException) {
                 throw e
@@ -217,14 +298,19 @@ class MoviesViewModel(application: Application) : AndroidViewModel(application) 
         initialCategoryTitle: String? = null
     ) {
         val provider = _selectedProvider.value ?: return
-        _isScrapersLoading.value = true
+        if (_scrapers.value.isEmpty()) {
+            _isScrapersLoading.value = true
+        }
         try {
             val manifest = runner.fetchManifest(provider.url)
             val filteredScrapers = manifest.filter { it.value in installed }
-            _scrapers.value = filteredScrapers
+            if (filteredScrapers.isNotEmpty()) {
+                _scrapers.value = filteredScrapers
+                cacheStore.putScrapers(provider.url, manifest)
+            }
             Log.d("MoviesViewModel", "Scrapers loaded: ${filteredScrapers.size}")
 
-            // No installed scrapers → clear all cached data so UI shows empty state
+            // No installed scrapers → clear all data so UI shows empty state
             if (filteredScrapers.isEmpty()) {
                 _selectedScraper.value = null
                 _movies.value = emptyList()
@@ -243,8 +329,10 @@ class MoviesViewModel(application: Application) : AndroidViewModel(application) 
             throw e
         } catch (e: Exception) {
             Log.e("MoviesViewModel", "Error loading scrapers", e)
-            _scrapers.value = emptyList()
-            _selectedScraper.value = null
+            if (_scrapers.value.isEmpty()) {
+                _scrapers.value = emptyList()
+                _selectedScraper.value = null
+            }
         } finally {
             _isScrapersLoading.value = false
         }
@@ -255,13 +343,17 @@ class MoviesViewModel(application: Application) : AndroidViewModel(application) 
         val scraper = _selectedScraper.value ?: return
 
         viewModelScope.launch {
-            _isLoading.value = true
-            _movies.value = emptyList()
+            if (_movies.value.isEmpty()) {
+                _isLoading.value = true
+            }
             _page.value = 1
             _hasMore.value = true
             try {
                 val (catList, _) = runner.getCatalog(provider.url, scraper.value)
-                _categories.value = catList
+                if (catList.isNotEmpty()) {
+                    _categories.value = catList
+                    cacheStore.putCategories(provider.url, scraper.value, catList)
+                }
                 Log.d("MoviesViewModel", "Categories loaded: ${catList.size} for ${scraper.display_name}")
 
                 val targetCat = if (initialCategoryTitle != null) {
@@ -277,17 +369,22 @@ class MoviesViewModel(application: Application) : AndroidViewModel(application) 
                 val newMovies = runner.getPosts(provider.url, scraper.value, filter, 1)
                 Log.d("MoviesViewModel", "Movies loaded: ${newMovies.size}")
                 if (newMovies.isEmpty()) {
-                    _hasMore.value = false
+                    if (_movies.value.isEmpty()) {
+                        _hasMore.value = false
+                    }
                 } else {
                     _movies.value = newMovies
                     _page.value = 2
+                    cacheStore.putMovies(provider.url, scraper.value, filter, newMovies)
                 }
             } catch (e: kotlinx.coroutines.CancellationException) {
                 throw e
             } catch (e: Exception) {
                 Log.e("MoviesViewModel", "Error loading catalog/movies: ${e.message}", e)
-                _categories.value = emptyList()
-                _selectedCategory.value = null
+                if (_categories.value.isEmpty()) {
+                    _categories.value = emptyList()
+                    _selectedCategory.value = null
+                }
             } finally {
                 _isLoading.value = false
             }

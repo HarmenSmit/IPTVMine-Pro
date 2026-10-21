@@ -57,6 +57,8 @@ class MainActivity : ComponentActivity() {
     @OptIn(ExperimentalTvMaterial3Api::class)
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        com.samyak.player.StreamResolverHolder.resolver =
+            com.samyak.television.data.VegaStreamResolver(applicationContext)
         setContent {
             IPTVMineProTheme {
                 Surface(

@@ -37,6 +37,7 @@ import androidx.compose.material3.Icon
 import androidx.compose.ui.res.painterResource
 import com.samyak.television.R
 import com.samyak.player.StreamOption
+import com.samyak.player.EpisodeItem
 import androidx.activity.compose.BackHandler
 import androidx.compose.ui.focus.FocusRequester
 import androidx.compose.ui.focus.focusRequester
@@ -111,10 +112,6 @@ fun MovieDetailScreen(
         }
     }
 
-    LaunchedEffect(link) {
-        fetchMeta()
-    }
-
     val loadEpisodes: (String) -> Unit = { epLink ->
         scope.launch {
             loadingEpisodesLink = epLink
@@ -125,6 +122,20 @@ fun MovieDetailScreen(
                 Toast.makeText(context, "Failed to load episodes: ${e.message}", Toast.LENGTH_SHORT).show()
             } finally {
                 loadingEpisodesLink = null
+            }
+        }
+    }
+
+    LaunchedEffect(link) {
+        fetchMeta()
+    }
+
+    LaunchedEffect(meta) {
+        val firstLink = meta?.linkList?.firstOrNull()
+        if (firstLink != null) {
+            expandedLinks = setOf(firstLink.title)
+            if (firstLink.episodesLink != null && !episodesMap.containsKey(firstLink.episodesLink)) {
+                loadEpisodes(firstLink.episodesLink)
             }
         }
     }
@@ -143,7 +154,9 @@ fun MovieDetailScreen(
             resolvingStream = true
             try {
                 val resolveType = getResolveType(directLink.type)
-                val streams = runner.getStream(providerUrl, scraperValue, directLink.link, resolveType).filter { it.link.isNotBlank() }
+                val streams = prioritizeStreams(
+                    runner.getStream(providerUrl, scraperValue, directLink.link, resolveType).filter { it.link.isNotBlank() }
+                )
                 if (streams.isEmpty()) {
                     Toast.makeText(context, "No stream links found", Toast.LENGTH_SHORT).show()
                 } else {
@@ -627,52 +640,60 @@ fun MovieDetailScreen(
                                                     if (episodes.isNullOrEmpty()) {
                                                         Text("No episodes loaded.", color = Color.Gray, fontSize = 12.sp, modifier = Modifier.padding(8.dp))
                                                     } else {
-                                                        episodes.forEach { episode ->
-                                                            val hasEpLink = episode.episodesLink != null
-                                                            val hasDirectLinks = !episode.directLinks.isNullOrEmpty()
+                                                    val playlist = buildEpisodePlaylist(episodes, vegaLink.title) { getResolveType(it) }
+                                                    episodes.forEach { episode ->
+                                                        val hasEpLink = episode.episodesLink != null
+                                                        val hasDirectLinks = !episode.directLinks.isNullOrEmpty()
 
-                                                            Surface(
-                                                                onClick = {
-                                                                    if (hasDirectLinks) {
-                                                                        onDirectLinkClick(episode.directLinks!![0], "${vegaLink.title} - ${episode.title}")
-                                                                    } else if (hasEpLink) {
-                                                                        streamResolutionJob?.cancel()
-                                                                        streamResolutionJob = scope.launch {
-                                                                            resolvingStream = true
-                                                                            try {
-                                                                                val streams = runner.getStream(providerUrl, scraperValue, episode.episodesLink!!, getResolveType("series")).filter { it.link.isNotBlank() }
-                                                                                if (streams.isEmpty()) {
-                                                                                    Toast.makeText(context, "No stream links found", Toast.LENGTH_SHORT).show()
-                                                                                } else {
-                                                                                    val selectedStream = streams[0]
-                                                                                    val epTitle = "${vegaLink.title} - ${episode.title}"
-                                                                                    Toast.makeText(context, "Playing: ${selectedStream.server} - ${selectedStream.quality}", Toast.LENGTH_SHORT).show()
-                                                                                    com.samyak.player.PlayerActivity.start(
-                                                                                        context = context,
-                                                                                        name = "$epTitle - ${selectedStream.quality}",
-                                                                                        streamUrl = selectedStream.link,
-                                                                                        headers = selectedStream.headers,
-                                                                                        watchHistoryEnabled = true,
-                                                                                        movieLink = "$link#${android.net.Uri.encode(epTitle)}",
-                                                                                        movieImage = movieMeta.image,
-                                                                                        providerUrl = providerUrl,
-                                                                                        scraperValue = scraperValue,
-                                                                                        streamFallbacks = ArrayList(streams.map { StreamOption(it.link, HashMap(it.headers ?: emptyMap())) })
-                                                                                    )
-                                                                                }
-                                                                            } catch (e: Exception) {
-                                                                                Toast.makeText(context, "Error resolving stream: ${e.message}", Toast.LENGTH_SHORT).show()
-                                                                            } finally {
-                                                                                resolvingStream = false
+                                                        Surface(
+                                                            onClick = {
+                                                                val epTargetLink = if (hasDirectLinks) episode.directLinks!![0].link else episode.episodesLink
+                                                                val epTargetType = if (hasDirectLinks) getResolveType(episode.directLinks!![0].type) else getResolveType("series")
+                                                                val epIndex = playlist.indexOfFirst { it.link == epTargetLink }.coerceAtLeast(0)
+                                                                if (epTargetLink != null) {
+                                                                    streamResolutionJob?.cancel()
+                                                                    streamResolutionJob = scope.launch {
+                                                                        resolvingStream = true
+                                                                        try {
+                                                                            val streams = prioritizeStreams(
+                                                                                runner.getStream(providerUrl, scraperValue, epTargetLink, epTargetType).filter { it.link.isNotBlank() }
+                                                                            )
+                                                                            if (streams.isEmpty()) {
+                                                                                Toast.makeText(context, "No stream links found", Toast.LENGTH_SHORT).show()
+                                                                            } else {
+                                                                                val selectedStream = streams[0]
+                                                                                val epTitle = "${vegaLink.title} - ${episode.title}"
+                                                                                Toast.makeText(context, "Playing: ${selectedStream.server} - ${selectedStream.quality}", Toast.LENGTH_SHORT).show()
+                                                                                com.samyak.player.PlayerActivity.start(
+                                                                                    context = context,
+                                                                                    name = "$epTitle - ${selectedStream.quality}",
+                                                                                    streamUrl = selectedStream.link,
+                                                                                    headers = selectedStream.headers,
+                                                                                    watchHistoryEnabled = true,
+                                                                                    movieLink = "$link#${android.net.Uri.encode(epTitle)}",
+                                                                                    movieImage = movieMeta.image,
+                                                                                    providerUrl = providerUrl,
+                                                                                    scraperValue = scraperValue,
+                                                                                    episodes = playlist,
+                                                                                    episodeIndex = epIndex,
+                                                                                    streamFallbacks = ArrayList(streams.map { StreamOption(it.link, HashMap(it.headers ?: emptyMap())) })
+                                                                                )
                                                                             }
+                                                                        } catch (e: Exception) {
+                                                                            Toast.makeText(context, "Error resolving stream: ${e.message}", Toast.LENGTH_SHORT).show()
+                                                                        } finally {
+                                                                            resolvingStream = false
                                                                         }
                                                                     }
-                                                                },
+                                                                }
+                                                            },
                                                                 colors = ClickableSurfaceDefaults.colors(
-                                                                    containerColor = Color.Transparent,
-                                                                    focusedContainerColor = Color(0xFF26A69A).copy(alpha = 0.2f)
+                                                                    containerColor = Color(0xFF1E1E1E),
+                                                                    focusedContainerColor = Color(0xFF26A69A),
+                                                                    pressedContainerColor = Color(0xFF208b80)
                                                                 ),
-                                                                shape = ClickableSurfaceDefaults.shape(RoundedCornerShape(4.dp)),
+                                                                scale = ClickableSurfaceDefaults.scale(focusedScale = 1.02f),
+                                                                shape = ClickableSurfaceDefaults.shape(RoundedCornerShape(8.dp)),
                                                                 modifier = Modifier
                                                                     .focusProperties {
                                                                         left = if (hasWatchNow) watchNowFocusRequester else backButtonFocusRequester
@@ -681,13 +702,62 @@ fun MovieDetailScreen(
                                                                     .fillMaxWidth()
                                                                     .padding(vertical = 4.dp)
                                                             ) {
-                                                                Text(
-                                                                    text = episode.title,
-                                                                    fontSize = 13.sp,
-                                                                    color = Color(0xFF26A69A),
-                                                                    fontWeight = FontWeight.SemiBold,
-                                                                    modifier = Modifier.padding(10.dp)
-                                                                )
+                                                                Row(
+                                                                    modifier = Modifier.padding(8.dp),
+                                                                    verticalAlignment = Alignment.CenterVertically,
+                                                                    horizontalArrangement = Arrangement.spacedBy(12.dp)
+                                                                ) {
+                                                                    // 16:9 Thumbnail Box
+                                                                    Box(
+                                                                        modifier = Modifier
+                                                                            .width(96.dp)
+                                                                            .aspectRatio(16f / 9f)
+                                                                            .clip(RoundedCornerShape(6.dp))
+                                                                            .background(Color(0xFF2C2A36)),
+                                                                        contentAlignment = Alignment.Center
+                                                                    ) {
+                                                                        val thumbUrl = episode.image?.takeIf { it.isNotBlank() } ?: movieMeta.image
+                                                                        if (thumbUrl.isNotBlank()) {
+                                                                            AsyncImage(
+                                                                                model = thumbUrl,
+                                                                                contentDescription = episode.title,
+                                                                                contentScale = ContentScale.Crop,
+                                                                                modifier = Modifier.fillMaxSize()
+                                                                            )
+                                                                        }
+                                                                        Icon(
+                                                                            imageVector = Icons.Default.PlayArrow,
+                                                                            contentDescription = null,
+                                                                            tint = Color.White,
+                                                                            modifier = Modifier.size(16.dp)
+                                                                        )
+                                                                    }
+                                                                    Column(modifier = Modifier.weight(1f)) {
+                                                                        Text(
+                                                                            text = episode.title,
+                                                                            fontSize = 13.sp,
+                                                                            color = Color.White,
+                                                                            fontWeight = FontWeight.Bold,
+                                                                            maxLines = 1,
+                                                                            overflow = TextOverflow.Ellipsis
+                                                                        )
+                                                                        val sub = listOfNotNull(
+                                                                            episode.episodeNumber?.let { "Ep $it" },
+                                                                            episode.date,
+                                                                            episode.duration
+                                                                        ).joinToString(" • ")
+                                                                        if (sub.isNotBlank()) {
+                                                                            Spacer(modifier = Modifier.height(2.dp))
+                                                                            Text(
+                                                                                text = sub,
+                                                                                fontSize = 11.sp,
+                                                                                color = Color.LightGray,
+                                                                                maxLines = 1,
+                                                                                overflow = TextOverflow.Ellipsis
+                                                                            )
+                                                                        }
+                                                                    }
+                                                                }
                                                             }
                                                         }
                                                     }
@@ -732,3 +802,34 @@ fun MovieDetailScreen(
         }
     }
 }
+
+fun buildEpisodePlaylist(
+    episodes: List<VegaLink>,
+    seasonTitle: String,
+    resolveType: (String) -> String
+): ArrayList<EpisodeItem> {
+    val list = ArrayList<EpisodeItem>()
+    for (ep in episodes) {
+        val dls = ep.directLinks
+        if (dls != null && dls.isNotEmpty()) {
+            val dl = dls[0]
+            list.add(
+                EpisodeItem(
+                    title = "$seasonTitle - ${ep.title} (${dl.title})",
+                    link = dl.link,
+                    type = resolveType(dl.type)
+                )
+            )
+        } else if (ep.episodesLink != null) {
+            list.add(
+                EpisodeItem(
+                    title = "$seasonTitle - ${ep.title}",
+                    link = ep.episodesLink,
+                    type = resolveType("series")
+                )
+            )
+        }
+    }
+    return list
+}
+
