@@ -47,6 +47,11 @@ fun MoviesScreen(
     val providerRepository = remember { ProviderRepository(context) }
     val extensionRepository = remember { ExtensionRepository.getInstance(context) }
     val runner = remember { VegaProviderRunner(context) }
+    DisposableEffect(Unit) {
+        onDispose {
+            runner.destroy()
+        }
+    }
     val cacheStore = remember { com.samyak.television.data.MovieCacheStore.getInstance(context) }
     
     val vegaProviders = remember { providerRepository.getProviders().filter { it.isActive && it.safeType == ProviderType.VEGA } }

@@ -194,14 +194,31 @@ fun ExtensionsScreen() {
                                 verticalAlignment = Alignment.CenterVertically
                             ) {
                                 Column(modifier = Modifier.weight(1f)) {
-                                    Text(
-                                        text = ext.display_name,
-                                        fontSize = 15.sp,
-                                        fontWeight = FontWeight.Bold,
-                                        color = Color.White,
-                                        maxLines = 1,
-                                        overflow = TextOverflow.Ellipsis
-                                    )
+                                    Row(verticalAlignment = Alignment.CenterVertically) {
+                                        Text(
+                                            text = ext.display_name,
+                                            fontSize = 15.sp,
+                                            fontWeight = FontWeight.Bold,
+                                            color = Color.White,
+                                            maxLines = 1,
+                                            overflow = TextOverflow.Ellipsis
+                                        )
+                                        if (isInstalled) {
+                                            Spacer(modifier = Modifier.width(8.dp))
+                                            Box(
+                                                modifier = Modifier
+                                                    .background(Color(0xFF26A69A).copy(alpha = 0.2f), RoundedCornerShape(4.dp))
+                                                    .padding(horizontal = 6.dp, vertical = 2.dp)
+                                            ) {
+                                                Text(
+                                                    text = "Installed",
+                                                    fontSize = 11.sp,
+                                                    fontWeight = FontWeight.Bold,
+                                                    color = Color(0xFF26A69A)
+                                                )
+                                            }
+                                        }
+                                    }
                                     Spacer(modifier = Modifier.height(4.dp))
                                     Text(
                                         text = "v${ext.version} • ${ext.type}",

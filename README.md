@@ -91,6 +91,7 @@ graph TD
 - **Automatic Playback**: Resolves streams dynamically and starts the highest-quality source first.
 - **Resilient Execution**: Implements a 3-attempt JS evaluation retry loop with automatic WebView re-creation on scrapes that timeout.
 - For a developer guide on writing JS extensions, see [VEGA_DOCS.md](VEGA_DOCS.md).
+- For performance benchmarks, speed improvements, and old vs new code comparisons, see [SPEED_COMPARISON.md](SPEED_COMPARISON.md).
 
 ---
 

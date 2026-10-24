@@ -259,10 +259,7 @@ class PlayerActivity : AppCompatActivity() {
         }
     }
 
-    override fun onCreate(savedInstanceState: Bundle?) {
-        super.onCreate(savedInstanceState)
-        setContentView(R.layout.activity_player)
-
+    private fun parseIntentData(intent: Intent?) {
         channelName = intent?.getStringExtra("channel_name")
         val rawUrl = intent?.getStringExtra("channel_stream_url")
         channelStreamUrl = rawUrl?.let { normalizeUrl(it) }
@@ -284,7 +281,55 @@ class PlayerActivity : AppCompatActivity() {
             }
             streamCandidates.add(StreamOption(channelStreamUrl!!, headersMap))
         }
+
+        // Filter out Pixeldrain links so they are not used
+        val filteredCandidates = ArrayList(streamCandidates.filterNot {
+            it.url.contains("pixeldrain", ignoreCase = true) || it.url.contains("pdrain", ignoreCase = true)
+        })
+        if (filteredCandidates.isNotEmpty()) {
+            streamCandidates = filteredCandidates
+            channelStreamUrl = streamCandidates[0].url
+        }
         currentStreamIndex = 0
+        playbackPosition = 0L
+    }
+
+    override fun onNewIntent(intent: Intent) {
+        super.onNewIntent(intent)
+        setIntent(intent)
+        Log.d(TAG, "onNewIntent received with new stream intent")
+        try {
+            stopProgressBarUpdates()
+            releasePlayer()
+        } catch (e: Exception) {
+            Log.e(TAG, "Error releasing old player in onNewIntent", e)
+        }
+
+        parseIntentData(intent)
+
+        if (channelStreamUrl.isNullOrBlank()) {
+            Log.e(TAG, "No valid channel stream url received in onNewIntent")
+            showError("Invalid stream link: empty or blank")
+            return
+        }
+
+        errorTextView.visibility = View.GONE
+        progressBar.visibility = View.VISIBLE
+        channelName?.let {
+            if (it.isNotEmpty()) {
+                videoTitle.text = it
+                videoTitle.isSelected = true
+            }
+        }
+
+        setupPlayer()
+    }
+
+    override fun onCreate(savedInstanceState: Bundle?) {
+        super.onCreate(savedInstanceState)
+        setContentView(R.layout.activity_player)
+
+        parseIntentData(intent)
 
         // Detect TV mode
         val uiModeManager = getSystemService(Context.UI_MODE_SERVICE) as android.app.UiModeManager

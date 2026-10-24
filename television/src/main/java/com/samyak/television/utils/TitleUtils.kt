@@ -30,4 +30,21 @@ object TitleUtils {
             .replace("\\s+".toRegex(), " ")
             .trim()
     }
+
+    /**
+     * Extracts the clean core title suitable for search across multiple providers.
+     * Strips out language tags like [Hindi], audio tags, release years, season suffixes, etc.
+     */
+    fun getSearchableTitle(title: String?): String {
+        val base = cleanTitle(title)
+        if (base.isBlank()) return ""
+        return base
+            .replace(Regex("\\[.*?\\]"), "")
+            .replace(Regex("\\(.*?\\)"), "")
+            .replace(Regex("(?i)\\b(season\\s*\\d+|s\\d+|episode\\s*\\d+|ep\\s*\\d+|part\\s*\\d+)\\b.*"), "")
+            .replace(Regex("(?i)\\b(hindi|english|tamil|telugu|kannada|malayalam|dubbed|dual audio|multi audio|org audio|web-dl|bluray|hdrip|hdcam|720p|1080p|480p|4k)\\b.*"), "")
+            .replace(Regex("[-–—:|]+"), " ")
+            .replace("\\s+".toRegex(), " ")
+            .trim()
+    }
 }

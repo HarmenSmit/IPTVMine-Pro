@@ -29,6 +29,7 @@ import androidx.compose.material3.CircularProgressIndicator
 import coil.compose.AsyncImage
 import coil.request.ImageRequest
 import com.samyak.television.data.VegaProviderRunner
+import com.samyak.television.data.VegaStreamFallbackEngine
 import com.samyak.television.model.*
 import kotlinx.coroutines.launch
 import androidx.compose.material.icons.Icons
@@ -56,6 +57,11 @@ fun MovieDetailScreen(
     val context = LocalContext.current
     val scope = rememberCoroutineScope()
     val runner = remember { VegaProviderRunner(context) }
+    DisposableEffect(Unit) {
+        onDispose {
+            runner.destroy()
+        }
+    }
     val cleanLink = remember(link) { link.split('#')[0] }
 
     var meta by remember { mutableStateOf<VegaMeta?>(null) }
@@ -89,6 +95,7 @@ fun MovieDetailScreen(
     // Stream resolution state (Note: streamsToSelect panel is inactive — auto-play uses streams[0])
     var streamsToSelect by remember { mutableStateOf<List<VegaStream>?>(null) }
     var resolvingStream by remember { mutableStateOf(false) }
+    var streamStatusText by remember { mutableStateOf("Resolving stream links...") }
     var selectedItemTitle by remember { mutableStateOf("") }
     var streamResolutionJob by remember { mutableStateOf<kotlinx.coroutines.Job?>(null) }
 
@@ -141,10 +148,12 @@ fun MovieDetailScreen(
     }
 
     val getResolveType: (String) -> String = { defaultType ->
-        if (scraperValue.equals("vega", ignoreCase = true)) {
-            "movie"
-        } else {
-            if (meta?.type?.lowercase() == "movie") "movie" else if (meta?.type?.lowercase() == "series") "series" else defaultType
+        val mType = meta?.type?.lowercase() ?: ""
+        when {
+            mType == "series" || defaultType.equals("series", ignoreCase = true) -> "series"
+            mType == "movie" || defaultType.equals("movie", ignoreCase = true) -> "movie"
+            defaultType.isNotBlank() -> defaultType
+            else -> "movie"
         }
     }
 
@@ -152,17 +161,33 @@ fun MovieDetailScreen(
         streamResolutionJob?.cancel()
         streamResolutionJob = scope.launch {
             resolvingStream = true
+            streamStatusText = "Resolving stream links..."
             try {
                 val resolveType = getResolveType(directLink.type)
-                val streams = prioritizeStreams(
-                    runner.getStream(providerUrl, scraperValue, directLink.link, resolveType).filter { it.link.isNotBlank() }
+                val fallbackRes = VegaStreamFallbackEngine.resolveWithAutoFallback(
+                    context = context,
+                    runner = runner,
+                    initialLink = directLink.link,
+                    initialType = resolveType,
+                    itemTitle = title,
+                    movieTitle = meta?.title ?: title,
+                    currentMeta = meta,
+                    currentProviderUrl = providerUrl,
+                    currentScraperValue = scraperValue,
+                    onStatusUpdate = { status -> streamStatusText = status }
                 )
-                if (streams.isEmpty()) {
+
+                if (fallbackRes == null) {
                     Toast.makeText(context, "No stream links found", Toast.LENGTH_SHORT).show()
                 } else {
-                    val selectedStream = streams[0]
+                    val selectedStream = fallbackRes.selectedStream
+                    val streams = fallbackRes.allStreams
                     val fallbacks = ArrayList(streams.map { StreamOption(it.link, HashMap(it.headers ?: emptyMap())) })
-                    Toast.makeText(context, "Playing: ${selectedStream.server} - ${selectedStream.quality}", Toast.LENGTH_SHORT).show()
+                    if (fallbackRes.message != null) {
+                        Toast.makeText(context, fallbackRes.message, Toast.LENGTH_SHORT).show()
+                    } else {
+                        Toast.makeText(context, "Playing: ${selectedStream.server} - ${selectedStream.quality}", Toast.LENGTH_SHORT).show()
+                    }
                     val mLink = if (meta?.type?.lowercase() == "series") {
                         "$link#${android.net.Uri.encode(title)}"
                     } else {
@@ -181,8 +206,26 @@ fun MovieDetailScreen(
                         streamFallbacks = fallbacks
                     )
                 }
+            } catch (e: kotlinx.coroutines.CancellationException) {
+                throw e
             } catch (e: Exception) {
-                Toast.makeText(context, "Error resolving stream: ${e.message}", Toast.LENGTH_SHORT).show()
+                if (directLink.link.startsWith("http://", ignoreCase = true) || directLink.link.startsWith("https://", ignoreCase = true)) {
+                    val mLink = if (meta?.type?.lowercase() == "series") "$link#${android.net.Uri.encode(title)}" else link
+                    com.samyak.player.PlayerActivity.start(
+                        context = context,
+                        name = "$title - HD",
+                        streamUrl = directLink.link,
+                        headers = null,
+                        watchHistoryEnabled = true,
+                        movieLink = mLink,
+                        movieImage = meta?.image ?: "",
+                        providerUrl = providerUrl,
+                        scraperValue = scraperValue,
+                        streamFallbacks = arrayListOf(StreamOption(directLink.link, HashMap()))
+                    )
+                } else {
+                    Toast.makeText(context, "Error resolving stream: ${e.message}", Toast.LENGTH_SHORT).show()
+                }
             } finally {
                 resolvingStream = false
             }
@@ -465,7 +508,15 @@ fun MovieDetailScreen(
                     val streams = streamsToSelect
                     if (resolvingStream) {
                         Box(modifier = Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
-                            CircularProgressIndicator(color = Color(0xFF26A69A))
+                            Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                                CircularProgressIndicator(color = Color(0xFF26A69A))
+                                Spacer(modifier = Modifier.height(16.dp))
+                                Text(
+                                    text = streamStatusText,
+                                    fontSize = 14.sp,
+                                    color = Color.White.copy(alpha = 0.8f)
+                                )
+                            }
                         }
                     } else if (streams != null) {
                         // Display resolved stream links selection list
@@ -654,21 +705,56 @@ fun MovieDetailScreen(
                                                                     streamResolutionJob?.cancel()
                                                                     streamResolutionJob = scope.launch {
                                                                         resolvingStream = true
+                                                                        streamStatusText = "Resolving stream links..."
                                                                         try {
-                                                                            val streams = prioritizeStreams(
-                                                                                runner.getStream(providerUrl, scraperValue, epTargetLink, epTargetType).filter { it.link.isNotBlank() }
-                                                                            )
-                                                                            if (streams.isEmpty()) {
-                                                                                Toast.makeText(context, "No stream links found", Toast.LENGTH_SHORT).show()
-                                                                            } else {
-                                                                                val selectedStream = streams[0]
+                                                                          val epTitle = "${vegaLink.title} - ${episode.title}"
+                                                                          val fallbackRes = VegaStreamFallbackEngine.resolveWithAutoFallback(
+                                                                              context = context,
+                                                                              runner = runner,
+                                                                              initialLink = epTargetLink,
+                                                                              initialType = epTargetType,
+                                                                              itemTitle = epTitle,
+                                                                              movieTitle = movieMeta.title,
+                                                                              currentMeta = movieMeta,
+                                                                              currentProviderUrl = providerUrl,
+                                                                              currentScraperValue = scraperValue,
+                                                                              onStatusUpdate = { status -> streamStatusText = status }
+                                                                          )
+                                                                          if (fallbackRes == null) {
+                                                                              Toast.makeText(context, "No stream links found", Toast.LENGTH_SHORT).show()
+                                                                          } else {
+                                                                              val selectedStream = fallbackRes.selectedStream
+                                                                              val streams = fallbackRes.allStreams
+                                                                              if (fallbackRes.message != null) {
+                                                                                  Toast.makeText(context, fallbackRes.message, Toast.LENGTH_SHORT).show()
+                                                                              } else {
+                                                                                  Toast.makeText(context, "Playing: ${selectedStream.server} - ${selectedStream.quality}", Toast.LENGTH_SHORT).show()
+                                                                              }
+                                                                              com.samyak.player.PlayerActivity.start(
+                                                                                  context = context,
+                                                                                  name = "$epTitle - ${selectedStream.quality}",
+                                                                                  streamUrl = selectedStream.link,
+                                                                                  headers = selectedStream.headers,
+                                                                                  watchHistoryEnabled = true,
+                                                                                  movieLink = "$link#${android.net.Uri.encode(epTitle)}",
+                                                                                  movieImage = movieMeta.image,
+                                                                                  providerUrl = providerUrl,
+                                                                                  scraperValue = scraperValue,
+                                                                                  episodes = playlist,
+                                                                                  episodeIndex = epIndex,
+                                                                                  streamFallbacks = ArrayList(streams.map { StreamOption(it.link, HashMap(it.headers ?: emptyMap())) })
+                                                                              )
+                                                                          }
+                                                                        } catch (e: kotlinx.coroutines.CancellationException) {
+                                                                            throw e
+                                                                        } catch (e: Exception) {
+                                                                            if (epTargetLink.startsWith("http://", ignoreCase = true) || epTargetLink.startsWith("https://", ignoreCase = true)) {
                                                                                 val epTitle = "${vegaLink.title} - ${episode.title}"
-                                                                                Toast.makeText(context, "Playing: ${selectedStream.server} - ${selectedStream.quality}", Toast.LENGTH_SHORT).show()
                                                                                 com.samyak.player.PlayerActivity.start(
                                                                                     context = context,
-                                                                                    name = "$epTitle - ${selectedStream.quality}",
-                                                                                    streamUrl = selectedStream.link,
-                                                                                    headers = selectedStream.headers,
+                                                                                    name = "$epTitle - HD",
+                                                                                    streamUrl = epTargetLink,
+                                                                                    headers = null,
                                                                                     watchHistoryEnabled = true,
                                                                                     movieLink = "$link#${android.net.Uri.encode(epTitle)}",
                                                                                     movieImage = movieMeta.image,
@@ -676,11 +762,11 @@ fun MovieDetailScreen(
                                                                                     scraperValue = scraperValue,
                                                                                     episodes = playlist,
                                                                                     episodeIndex = epIndex,
-                                                                                    streamFallbacks = ArrayList(streams.map { StreamOption(it.link, HashMap(it.headers ?: emptyMap())) })
+                                                                                    streamFallbacks = arrayListOf(StreamOption(epTargetLink, HashMap()))
                                                                                 )
+                                                                            } else {
+                                                                                Toast.makeText(context, "Error resolving stream: ${e.message}", Toast.LENGTH_SHORT).show()
                                                                             }
-                                                                        } catch (e: Exception) {
-                                                                            Toast.makeText(context, "Error resolving stream: ${e.message}", Toast.LENGTH_SHORT).show()
                                                                         } finally {
                                                                             resolvingStream = false
                                                                         }

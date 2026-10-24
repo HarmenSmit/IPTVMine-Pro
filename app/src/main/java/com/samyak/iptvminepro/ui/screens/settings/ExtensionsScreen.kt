@@ -7,11 +7,13 @@ import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
+import androidx.compose.material.icons.filled.Check
 import androidx.compose.material.icons.filled.Delete
 import androidx.compose.material.icons.filled.Download
 import androidx.compose.material.icons.filled.Refresh
 import androidx.compose.material.icons.outlined.Extension
 import androidx.compose.material3.*
+import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.graphics.Color
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
@@ -63,8 +65,8 @@ fun ExtensionsScreen(
     val installedExtensions = remember(allExtensions, installedExtensionsState) {
         allExtensions.filter { it.value in installedExtensionsState }
     }
-    val availableExtensions = remember(allExtensions, installedExtensionsState) {
-        allExtensions.filter { it.value !in installedExtensionsState && !it.disabled }
+    val availableExtensions = remember(allExtensions) {
+        allExtensions.filter { !it.disabled }
     }
 
     // Load sources
@@ -102,7 +104,7 @@ fun ExtensionsScreen(
             allExtensions = distinctManifest
             
             val installedCount = distinctManifest.count { it.value in installedExtensionsState }
-            val availableCount = distinctManifest.count { it.value !in installedExtensionsState && !it.disabled }
+            val availableCount = distinctManifest.count { !it.disabled }
             if (installedCount == 0 && availableCount > 0) {
                 selectedTabIndex = 1 // Switch to available tab if none are installed
             }
@@ -226,9 +228,10 @@ fun ExtensionsScreen(
                         verticalArrangement = Arrangement.spacedBy(12.dp)
                     ) {
                         items(currentData, key = { it.value }) { extension ->
+                            val isItemInstalled = extension.value in installedExtensionsState
                             ExtensionItem(
                                 extension = extension,
-                                isInstalled = selectedTabIndex == 0,
+                                isInstalled = isItemInstalled,
                                 onAction = { installed ->
                                     extensionRepository.setExtensionInstalled(extension.value, installed)
                                     if (installed) {
@@ -348,12 +351,46 @@ fun ExtensionItem(
             Spacer(modifier = Modifier.width(14.dp))
 
             Column(modifier = Modifier.weight(1f)) {
-                Text(
-                    text = extension.display_name,
-                    style = MaterialTheme.typography.titleMedium,
-                    fontWeight = FontWeight.SemiBold,
-                    color = MaterialTheme.colorScheme.onSurface
-                )
+                Row(
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(8.dp)
+                ) {
+                    Text(
+                        text = extension.display_name,
+                        style = MaterialTheme.typography.titleMedium,
+                        fontWeight = FontWeight.SemiBold,
+                        color = MaterialTheme.colorScheme.onSurface,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis,
+                        modifier = Modifier.weight(1f, fill = false)
+                    )
+                    if (isInstalled) {
+                        Surface(
+                            shape = RoundedCornerShape(6.dp),
+                            color = MaterialTheme.colorScheme.primary.copy(alpha = 0.12f),
+                            border = BorderStroke(1.dp, MaterialTheme.colorScheme.primary.copy(alpha = 0.35f))
+                        ) {
+                            Row(
+                                verticalAlignment = Alignment.CenterVertically,
+                                modifier = Modifier.padding(horizontal = 6.dp, vertical = 2.dp)
+                            ) {
+                                Icon(
+                                    imageVector = Icons.Default.Check,
+                                    contentDescription = null,
+                                    tint = MaterialTheme.colorScheme.primary,
+                                    modifier = Modifier.size(12.dp)
+                                )
+                                Spacer(modifier = Modifier.width(3.dp))
+                                Text(
+                                    text = "Installed",
+                                    style = MaterialTheme.typography.labelSmall,
+                                    color = MaterialTheme.colorScheme.primary,
+                                    fontWeight = FontWeight.Bold
+                                )
+                            }
+                        }
+                    }
+                }
                 Spacer(modifier = Modifier.height(2.dp))
                 Text(
                     text = "v${extension.version} • ${extension.type}",

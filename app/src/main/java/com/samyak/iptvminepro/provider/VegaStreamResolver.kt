@@ -32,16 +32,30 @@ class VegaStreamResolver(context: Context) : StreamResolver {
         }
         scope.launch {
             try {
-                val streams = com.samyak.iptvminepro.model.prioritizeStreams(
-                    runner.getStream(providerUrl, scraperValue, link, type).filter { it.link.isNotBlank() }
+                val fallbackRes = VegaStreamFallbackEngine.resolveWithAutoFallback(
+                    context = appContext,
+                    runner = runner,
+                    initialLink = link,
+                    initialType = type,
+                    itemTitle = link,
+                    movieTitle = link,
+                    currentMeta = null,
+                    currentProviderUrl = providerUrl,
+                    currentScraperValue = scraperValue
                 )
-                if (streams.isEmpty()) {
-                    callback(null, "No stream links found")
+                if (fallbackRes != null && fallbackRes.allStreams.isNotEmpty()) {
+                    callback(fallbackRes.allStreams.map { StreamOption(it.link, HashMap(it.headers ?: emptyMap())) }, null)
+                } else if (link.startsWith("http://", ignoreCase = true) || link.startsWith("https://", ignoreCase = true)) {
+                    callback(listOf(StreamOption(link, HashMap())), null)
                 } else {
-                    callback(streams.map { StreamOption(it.link, HashMap(it.headers ?: emptyMap())) }, null)
+                    callback(null, "No stream links found")
                 }
             } catch (e: Exception) {
-                callback(null, e.message ?: "Error resolving stream")
+                if (link.startsWith("http://", ignoreCase = true) || link.startsWith("https://", ignoreCase = true)) {
+                    callback(listOf(StreamOption(link, HashMap())), null)
+                } else {
+                    callback(null, e.message ?: "Error resolving stream")
+                }
             }
         }
     }

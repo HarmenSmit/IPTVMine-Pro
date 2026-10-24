@@ -45,6 +45,11 @@ fun CategoryMoviesScreen(
     val context = LocalContext.current
     val scope = rememberCoroutineScope()
     val runner = remember { VegaProviderRunner(context) }
+    DisposableEffect(Unit) {
+        onDispose {
+            runner.destroy()
+        }
+    }
 
     var movies by remember { mutableStateOf<List<VegaPost>>(emptyList()) }
     var page by remember { mutableStateOf(1) }
