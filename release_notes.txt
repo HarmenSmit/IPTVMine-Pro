@@ -1,4 +1,11 @@
 IPTVmine Pro — Release Notes
+Version 1.1.2 (versionCode 12)
+
+Fixes
+- Fixed "Decoder failed" playback error for 10-bit HEVC videos on devices lacking hardware Main 10 support (such as emulators and older chipsets) by enabling FFmpeg software decoder fallback and graceful fallback dialog with external player option.
+
+
+IPTVmine Pro — Release Notes
 Version 1.0.9 (versionCode 9)
 
 New

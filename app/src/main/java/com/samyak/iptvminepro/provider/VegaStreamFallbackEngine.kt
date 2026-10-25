@@ -151,7 +151,7 @@ object VegaStreamFallbackEngine {
         if (installedExtensions.isNotEmpty()) {
             val cleanTitle = TitleUtils.getSearchableTitle(movieTitle).ifBlank { TitleUtils.getSearchableTitle(itemTitle) }
             if (cleanTitle.isNotBlank()) {
-                val priorityOrder = listOf(0"Vega", "Moviesmod", "UhdMovies", "1cinevood", "Katmovie", "hdhub", "TopMovies", "Multi", "movieBoxWeb")
+                val priorityOrder = listOf("Vega", "Moviesmod", "UhdMovies", "1cinevood", "Katmovie", "hdhub", "TopMovies", "Multi", "movieBoxWeb")
                 val sortedExtensions = installedExtensions.sortedBy { ext ->
                     val idx = priorityOrder.indexOfFirst { it.equals(ext, ignoreCase = true) }
                     if (idx >= 0) idx else 999

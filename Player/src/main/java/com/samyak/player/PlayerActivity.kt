@@ -4,14 +4,18 @@ import android.annotation.SuppressLint
 import android.app.PendingIntent
 import android.app.PictureInPictureParams
 import android.app.RemoteAction
+import android.content.ActivityNotFoundException
 import android.content.BroadcastReceiver
 import android.content.Context
+import android.content.DialogInterface
 import android.content.Intent
 import android.content.IntentFilter
 import android.content.pm.ActivityInfo
 import android.content.pm.PackageManager
 import android.content.res.Configuration
 import android.graphics.drawable.Icon
+import android.media.MediaCodecInfo
+import android.media.MediaCodecList
 import android.net.Uri
 import android.os.Build
 import android.os.Bundle
@@ -45,7 +49,9 @@ import androidx.media3.common.Tracks
 import androidx.media3.common.util.UnstableApi
 import androidx.media3.common.util.Util
 import androidx.media3.datasource.okhttp.OkHttpDataSource
+import androidx.media3.exoplayer.DefaultRenderersFactory
 import androidx.media3.exoplayer.ExoPlayer
+import io.github.anilbeesetti.nextlib.media3ext.ffdecoder.NextRenderersFactory
 import com.samyak.player.dns.DnsPreferenceManager
 import okhttp3.OkHttpClient
 import okhttp3.Request
@@ -202,6 +208,29 @@ class PlayerActivity : AppCompatActivity() {
         private const val ACTION_PIP_PLAY = "com.samyak2403.iptvmine.PIP_PLAY"
         private const val ACTION_PIP_PAUSE = "com.samyak2403.iptvmine.PIP_PAUSE"
         private const val PIP_REQUEST_CODE = 101
+
+        /**
+         * Checks whether the device hardware/platform decoders support HEVC Main 10 (10-bit).
+         */
+        @JvmStatic
+        fun isHevcMain10Supported(): Boolean {
+            return try {
+                val codecs = MediaCodecList(MediaCodecList.ALL_CODECS).codecInfos
+                codecs.any { info ->
+                    !info.isEncoder &&
+                    info.supportedTypes.any { it.equals("video/hevc", ignoreCase = true) } &&
+                    try {
+                        info.getCapabilitiesForType("video/hevc")?.profileLevels?.any {
+                            it.profile == MediaCodecInfo.CodecProfileLevel.HEVCProfileMain10
+                        } == true
+                    } catch (e: Exception) {
+                        false
+                    }
+                }
+            } catch (e: Exception) {
+                false
+            }
+        }
 
         fun start(
             context: Context,
@@ -850,14 +879,17 @@ class PlayerActivity : AppCompatActivity() {
             requestHeaders = headersMap.toMap()
             requestUserAgent = userAgent
 
-            // Setup track selector with data saving constraints
+            // Setup track selector with data saving constraints and avoid selecting unsupported tracks
             trackSelector = DefaultTrackSelector(this).apply {
-                setParameters(
-                    buildUponParameters()
-                        .setMaxVideoSizeSd() // Limit to SD quality when data saving is enabled
-                        .setMaxVideoBitrate(if (isDataSavingEnabled) 800_000 else Int.MAX_VALUE) // 800kbps for data saving
-                        .setForceLowestBitrate(isDataSavingEnabled)
-                )
+                val paramsBuilder = buildUponParameters()
+                    .setExceedRendererCapabilitiesIfNecessary(false)
+                if (isDataSavingEnabled) {
+                    paramsBuilder
+                        .setMaxVideoSizeSd()
+                        .setMaxVideoBitrate(800_000)
+                        .setForceLowestBitrate(true)
+                }
+                setParameters(paramsBuilder)
             }
 
             val dataSourceFactory = androidx.media3.datasource.DefaultDataSource.Factory(this, httpDataSourceFactory)
@@ -889,7 +921,11 @@ class PlayerActivity : AppCompatActivity() {
                 .setPrioritizeTimeOverSizeThresholds(true)
                 .build()
 
-            player = ExoPlayer.Builder(this)
+            val renderersFactory = NextRenderersFactory(this)
+                .setExtensionRendererMode(DefaultRenderersFactory.EXTENSION_RENDERER_MODE_ON)
+                .setEnableDecoderFallback(true)
+
+            player = ExoPlayer.Builder(this, renderersFactory)
                 .setTrackSelector(trackSelector!!)
                 .setSeekBackIncrementMs(10000)
                 .setSeekForwardIncrementMs(10000)
@@ -991,7 +1027,17 @@ class PlayerActivity : AppCompatActivity() {
                 }
 
                 override fun onPlayerError(error: PlaybackException) {
-                    handlePlayerError(error)
+                    val decoderProblem =
+                        error.errorCode == PlaybackException.ERROR_CODE_DECODING_FAILED ||
+                        error.errorCode == PlaybackException.ERROR_CODE_DECODER_INIT_FAILED ||
+                        error.errorCode == PlaybackException.ERROR_CODE_DECODING_FORMAT_EXCEEDS_CAPABILITIES
+
+                    if (decoderProblem) {
+                        Log.e("PlayerActivity", "Decoder error ${error.errorCodeName}: ${error.message}")
+                        onDecoderUnsupported()
+                    } else {
+                        handlePlayerError(error)
+                    }
                 }
 
                 override fun onTracksChanged(tracks: Tracks) {
@@ -1702,7 +1748,76 @@ class PlayerActivity : AppCompatActivity() {
         return detectAndCreateMediaItem(httpsUrl)
     }
 
+    private fun onDecoderUnsupported() {
+        if (isFinishing || isDestroyed) return
+
+        progressBar.visibility = View.GONE
+        player?.pause()
+
+        val streamUrl = channelStreamUrl
+        errorTextView.text = "This video uses a format (10-bit HEVC) that your device can't play in the built-in player."
+        errorTextView.visibility = View.VISIBLE
+        playerView.visibility = View.GONE
+
+        val dialog = android.app.AlertDialog.Builder(this)
+            .setMessage("This video uses a format (10-bit HEVC) that your device can't play in the built-in player.")
+            .setPositiveButton("Open in another player") { dialogInterface, _ ->
+                dialogInterface.dismiss()
+                if (!streamUrl.isNullOrBlank()) {
+                    try {
+                        val intent = Intent(Intent.ACTION_VIEW).apply {
+                            setDataAndType(Uri.parse(streamUrl), "video/*")
+                            addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                        }
+                        startActivity(Intent.createChooser(intent, "Open with"))
+                    } catch (e: ActivityNotFoundException) {
+                        Toast.makeText(this, "No other video player installed", Toast.LENGTH_LONG).show()
+                    } catch (e: Exception) {
+                        Log.e(TAG, "Error opening external player", e)
+                        Toast.makeText(this, "No other video player installed", Toast.LENGTH_LONG).show()
+                    }
+                } else {
+                    Toast.makeText(this, "No other video player installed", Toast.LENGTH_LONG).show()
+                }
+            }
+            .setNegativeButton("Close") { dialogInterface, _ ->
+                dialogInterface.dismiss()
+                finish()
+            }
+            .setOnCancelListener {
+                finish()
+            }
+            .create()
+
+        dialog.setOnShowListener {
+            val positiveBtn = dialog.getButton(DialogInterface.BUTTON_POSITIVE)
+            positiveBtn?.isFocusable = true
+            positiveBtn?.isFocusableInTouchMode = true
+            positiveBtn?.requestFocus()
+            val negativeBtn = dialog.getButton(DialogInterface.BUTTON_NEGATIVE)
+            negativeBtn?.isFocusable = true
+            negativeBtn?.isFocusableInTouchMode = true
+        }
+
+        try {
+            dialog.show()
+        } catch (e: Exception) {
+            Log.e(TAG, "Error showing unsupported decoder dialog", e)
+        }
+    }
+
     private fun handlePlayerError(error: PlaybackException) {
+        val decoderProblem =
+            error.errorCode == PlaybackException.ERROR_CODE_DECODING_FAILED ||
+            error.errorCode == PlaybackException.ERROR_CODE_DECODER_INIT_FAILED ||
+            error.errorCode == PlaybackException.ERROR_CODE_DECODING_FORMAT_EXCEEDS_CAPABILITIES
+
+        if (decoderProblem) {
+            Log.e("PlayerActivity", "Decoder error ${error.errorCodeName}: ${error.message}")
+            onDecoderUnsupported()
+            return
+        }
+
         Log.e(TAG, "Playback error: ${error.errorCodeName}", error)
 
         if (error.errorCode == PlaybackException.ERROR_CODE_BEHIND_LIVE_WINDOW) {
@@ -2743,3 +2858,9 @@ class PlayerActivity : AppCompatActivity() {
         hidePanelsHandler.postDelayed(hidePanelsRunnable, 1000L)
     }
 }
+
+/**
+ * Top-level helper in :Player checking whether the device supports HEVC Main 10 (10-bit).
+ */
+fun isHevcMain10Supported(): Boolean = PlayerActivity.isHevcMain10Supported()
+
