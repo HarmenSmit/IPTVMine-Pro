@@ -122,7 +122,7 @@ class ChannelsProvider(application: Application) : AndroidViewModel(application)
 
         private const val TAG = "ChannelsProvider"
         private const val DEFAULT_LOGO_URL = ""
-        private const val FETCH_COOLDOWN_MS = 5 * 60 * 1000L // 5 minutes
+        private const val FETCH_COOLDOWN_MS = 30 * 60 * 1000L // 30 minutes
         // Per-source exponential backoff bounds (used to stop hammering failing URLs)
         private const val BASE_BACKOFF_MS = 60 * 1000L // 1 minute
         private const val MAX_BACKOFF_MS = 60 * 60 * 1000L // 1 hour cap
