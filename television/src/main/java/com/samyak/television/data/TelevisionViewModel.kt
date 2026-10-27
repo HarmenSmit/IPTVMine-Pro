@@ -1,6 +1,8 @@
 package com.samyak.television.data
 
 import android.app.Application
+import android.os.CancellationSignal
+import android.os.OperationCanceledException
 import android.util.Log
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
@@ -21,6 +23,7 @@ class TelevisionViewModel(application: Application) : AndroidViewModel(applicati
     private val store by storeDelegate
     private var fetchJob: Job? = null
     private var filterJob: Job? = null
+    private var filterCancellationSignal: CancellationSignal? = null
     private val _filteredChannels = MutableStateFlow<List<Channel>>(emptyList())
     val filteredChannels: StateFlow<List<Channel>> = _filteredChannels.asStateFlow()
 
@@ -50,11 +53,22 @@ class TelevisionViewModel(application: Application) : AndroidViewModel(applicati
 
     private fun updateFilter() {
         filterJob?.cancel()
+        filterCancellationSignal?.cancel()
         val snapshot = _channels.value as? ChannelList<Channel> ?: return
         val category = _selectedCategory.value
+        val signal = CancellationSignal()
+        filterCancellationSignal = signal
         filterJob = viewModelScope.launch(Dispatchers.IO) {
-            val result = snapshot.filtered(category = category)
-            withContext(Dispatchers.Main) { _filteredChannels.value = result }
+            try {
+                val result = snapshot.filtered(category = category, cancellationSignal = signal)
+                withContext(Dispatchers.Main) {
+                    if (_channels.value === snapshot && filterCancellationSignal === signal) {
+                        _filteredChannels.value = result
+                    }
+                }
+            } catch (cancelled: OperationCanceledException) {
+                if (!signal.isCanceled) throw cancelled
+            }
         }
     }
 
@@ -114,6 +128,7 @@ class TelevisionViewModel(application: Application) : AndroidViewModel(applicati
 
     override fun onCleared() {
         fetchJob?.cancel(); filterJob?.cancel()
+        filterCancellationSignal?.cancel()
         val fetching = fetchJob
         val filtering = filterJob
         CoroutineScope(Dispatchers.IO).launch {

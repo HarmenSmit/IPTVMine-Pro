@@ -4,6 +4,7 @@ import android.content.Context
 import android.database.Cursor
 import android.database.DatabaseUtils
 import android.database.sqlite.SQLiteDatabase
+import android.os.CancellationSignal
 import com.google.gson.Gson
 import java.io.Closeable
 import java.util.UUID
@@ -28,6 +29,7 @@ class PlaylistStore<T>(
         db.execSQL("CREATE INDEX IF NOT EXISTS channels_generation ON channels(generation, id)")
         db.execSQL("CREATE INDEX IF NOT EXISTS channels_category ON channels(generation, category, id)")
         db.execSQL("CREATE TABLE IF NOT EXISTS active (source TEXT PRIMARY KEY, generation TEXT NOT NULL)")
+        ChannelSearchIndex.initialize(db)
     }
 
     inner class Import internal constructor(private val source: String) : Closeable {
@@ -39,6 +41,7 @@ class PlaylistStore<T>(
         var count = 0
             private set
         private val insert = db.compileStatement("INSERT INTO channels(generation,name,category,payload) VALUES(?,?,?,?)")
+        private val insertSearch = db.compileStatement("INSERT INTO ${ChannelSearchIndex.TABLE}(docid,grams) VALUES(?,?)")
 
         private fun commitBatch() {
             if (transactionOpen) {
@@ -53,10 +56,14 @@ class PlaylistStore<T>(
             if (payload.toByteArray(Charsets.UTF_8).size > 1024 * 1024) throw PlaylistLimitException("Channel record exceeds 1 MiB")
             if (!transactionOpen) { db.beginTransaction(); transactionOpen = true }
             insert.bindString(1, generation)
-            insert.bindString(2, nameOf(value).lowercase())
+            val name = nameOf(value).lowercase()
+            insert.bindString(2, name)
             insert.bindString(3, categoryOf(value))
             insert.bindString(4, payload)
-            insert.executeInsert()
+            val id = insert.executeInsert()
+            insertSearch.bindLong(1, id)
+            insertSearch.bindString(2, ChannelSearchTokens.document(name))
+            insertSearch.executeInsert()
             count++; pending++; pendingBytes += payload.length * 2
             // No Kotlin batch list: SQLite batches at most 250 records or 1 MiB of text.
             if (pending >= 250 || pendingBytes >= 1024 * 1024) commitBatch()
@@ -83,6 +90,7 @@ class PlaylistStore<T>(
         override fun close() {
             if (transactionOpen) { db.endTransaction(); transactionOpen = false }
             insert.close()
+            insertSearch.close()
             if (!published) db.delete("channels", "generation=?", arrayOf(generation))
         }
     }
@@ -115,7 +123,8 @@ class ChannelList<T> internal constructor(
     private val args: Array<String>,
     private val gson: Gson,
     private val type: Class<T>,
-    private val order: String
+    private val order: String,
+    cancellationSignal: CancellationSignal? = null
 ) : AbstractList<T>() {
     private val table = "snapshot_" + UUID.randomUUID().toString().replace("-", "")
     override val size: Int
@@ -123,8 +132,33 @@ class ChannelList<T> internal constructor(
         // The ordinal index lives on disk. Random UI access never scans an ever-growing OFFSET.
         db.execSQL("CREATE TABLE $table (position INTEGER PRIMARY KEY, channelId INTEGER NOT NULL)")
         try {
-            db.execSQL("INSERT INTO $table(channelId) SELECT id FROM channels WHERE $selection ORDER BY $order", args)
-            size = DatabaseUtils.longForQuery(db, "SELECT count(*) FROM $table", null).toInt()
+            size = if (cancellationSignal == null) {
+                db.execSQL("INSERT INTO $table(channelId) SELECT id FROM channels WHERE $selection ORDER BY $order", args)
+                DatabaseUtils.longForQuery(db, "SELECT count(*) FROM $table", null).toInt()
+            } else {
+                // execSQL(INSERT ... SELECT) cannot be cancelled. Read with a CancellationSignal
+                // and build the ordinal snapshot in a transaction, checking cancellation per row.
+                cancellationSignal.throwIfCanceled()
+                db.beginTransactionNonExclusive()
+                try {
+                    var count = 0
+                    db.compileStatement("INSERT INTO $table(channelId) VALUES(?)").use { insert ->
+                        db.rawQuery("SELECT id FROM channels WHERE $selection ORDER BY $order", args, cancellationSignal).use { cursor ->
+                            while (cursor.moveToNext()) {
+                                cancellationSignal.throwIfCanceled()
+                                insert.bindLong(1, cursor.getLong(0))
+                                insert.executeInsert()
+                                count++
+                            }
+                        }
+                    }
+                    cancellationSignal.throwIfCanceled()
+                    db.setTransactionSuccessful()
+                    count
+                } finally {
+                    db.endTransaction()
+                }
+            }
             PlaylistDatabases.register(db, table, this)
         } catch (failure: Exception) {
             db.execSQL("DROP TABLE IF EXISTS $table")
@@ -133,6 +167,10 @@ class ChannelList<T> internal constructor(
     }
     private val cache = object : LinkedHashMap<Int, T>(16, .75f, true) {}
     private var cacheChars = 0
+    private data class FilterKey(val query: String, val category: String?)
+    private val filteredCache = object : LinkedHashMap<FilterKey, ChannelList<T>>(8, .75f, true) {
+        override fun removeEldestEntry(eldest: MutableMap.MutableEntry<FilterKey, ChannelList<T>>?) = size > 8
+    }
 
     @Synchronized override fun get(index: Int): T {
         if (index !in 0 until size) throw IndexOutOfBoundsException("$index / $size")
@@ -156,13 +194,28 @@ class ChannelList<T> internal constructor(
         return checkNotNull(answer)
     }
 
-    fun filtered(query: String? = null, category: String? = null): ChannelList<T> {
-        if (query.isNullOrEmpty() && (category.isNullOrEmpty() || category.equals("all", true))) return this
+    fun filtered(query: String? = null, category: String? = null, cancellationSignal: CancellationSignal? = null): ChannelList<T> {
+        cancellationSignal?.throwIfCanceled()
+        val key = FilterKey(query.orEmpty().lowercase(), category?.takeUnless { it.isEmpty() || it.equals("all", true) })
+        if (key.query.isEmpty() && key.category == null) return this
+        synchronized(filteredCache) { filteredCache[key] }?.let { return it }
         var where = selection
         val parameters = args.toMutableList()
-        if (!query.isNullOrEmpty()) { where += " AND instr(name,?)>0"; parameters.add(query.lowercase()) }
-        if (!category.isNullOrEmpty() && !category.equals("all", true)) { where += " AND category=?"; parameters.add(category) }
-        return ChannelList(db, where, parameters.toTypedArray(), gson, type, order)
+        if (key.query.isNotEmpty()) {
+            ChannelSearchTokens.query(key.query)?.let { tokens ->
+                // Start with indexed candidates, rather than scanning every name in a generation.
+                // Very long names use a bounded overflow bucket; the literal check handles them.
+                where += " AND id IN (SELECT docid FROM ${ChannelSearchIndex.TABLE} WHERE grams MATCH ? UNION SELECT docid FROM ${ChannelSearchIndex.TABLE} WHERE grams MATCH '${ChannelSearchTokens.OVERFLOW}')"
+                parameters.add(tokens)
+            }
+            where += " AND instr(name,?)>0"
+            parameters.add(key.query)
+        }
+        if (key.category != null) { where += " AND category=?"; parameters.add(key.category) }
+        val result = ChannelList(db, where, parameters.toTypedArray(), gson, type, order, cancellationSignal)
+        cancellationSignal?.throwIfCanceled()
+        synchronized(filteredCache) { filteredCache[key] = result }
+        return result
     }
 
     fun categoryCounts(): List<Pair<String, Int>> = SqlList(db,

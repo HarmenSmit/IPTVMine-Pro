@@ -2,6 +2,8 @@ package com.samyak.iptvminepro.provider
 
 import android.util.Log
 import android.app.Application
+import android.os.CancellationSignal
+import android.os.OperationCanceledException
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.LiveData
 import androidx.lifecycle.MutableLiveData
@@ -28,6 +30,7 @@ class ChannelsProvider(application: Application) : AndroidViewModel(application)
     private val _categoryCounts = MutableLiveData<List<Pair<String, Int>>>(emptyList())
     val categoryCounts: LiveData<List<Pair<String, Int>>> get() = _categoryCounts
     private var filterJob: Job? = null
+    private var filterCancellationSignal: CancellationSignal? = null
 
     private val _channels = MutableLiveData<List<Channel>>(emptyList())
     val channels: LiveData<List<Channel>> get() = _channels
@@ -216,6 +219,7 @@ class ChannelsProvider(application: Application) : AndroidViewModel(application)
         val previous = fetchJob
         previous?.cancel()
         filterJob?.cancel()
+        filterCancellationSignal?.cancel()
         lastFetchTimestamp = System.currentTimeMillis()
         lastFetchedUrlsHash = urls.hashCode()
         _isLoading.value = true
@@ -541,16 +545,31 @@ class ChannelsProvider(application: Application) : AndroidViewModel(application)
 
     fun filterChannelsByQueryAndCategory(query: String?, category: String?) {
         filterJob?.cancel()
+        filterCancellationSignal?.cancel()
         val snapshot = _channels.value as? ChannelList<Channel> ?: return
+        val signal = CancellationSignal()
+        filterCancellationSignal = signal
         filterJob = viewModelScope.launch(Dispatchers.IO) {
-            val result = snapshot.filtered(query, category)
-            withContext(Dispatchers.Main) { _filteredChannels.value = result }
+            try {
+                // Clearing the query and category-only filtering remain immediate.
+                if (!query.isNullOrEmpty()) delay(250)
+                ensureActive()
+                val result = snapshot.filtered(query, category, signal)
+                withContext(Dispatchers.Main) {
+                    if (_channels.value === snapshot && filterCancellationSignal === signal) {
+                        _filteredChannels.value = result
+                    }
+                }
+            } catch (cancelled: OperationCanceledException) {
+                if (!signal.isCanceled) throw cancelled
+            }
         }
     }
 
     override fun onCleared() {
         fetchJob?.cancel()
         filterJob?.cancel()
+        filterCancellationSignal?.cancel()
         val fetching = fetchJob
         val filtering = filterJob
         CoroutineScope(Dispatchers.IO).launch {

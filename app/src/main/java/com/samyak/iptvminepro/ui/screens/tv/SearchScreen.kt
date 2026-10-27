@@ -124,7 +124,6 @@ fun SearchScreen(
                         isSelected = category == selectedCategory,
                         onClick = {
                             selectedCategory = category
-                            viewModel.filterChannelsByQueryAndCategory(searchQuery, selectedCategory)
                         }
                     )
                 }

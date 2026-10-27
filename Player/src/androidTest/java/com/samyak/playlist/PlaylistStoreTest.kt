@@ -2,6 +2,8 @@ package com.samyak.playlist
 
 import androidx.test.ext.junit.runners.AndroidJUnit4
 import androidx.test.platform.app.InstrumentationRegistry
+import android.os.CancellationSignal
+import android.os.OperationCanceledException
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.runBlocking
@@ -10,6 +12,10 @@ import org.junit.Assert.*
 import org.junit.Test
 import org.junit.runner.RunWith
 import java.util.UUID
+import java.util.concurrent.CountDownLatch
+import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicReference
+import kotlin.concurrent.thread
 
 @RunWith(AndroidJUnit4::class)
 class PlaylistStoreTest {
@@ -21,6 +27,99 @@ class PlaylistStoreTest {
         try { action(store) } finally { store.close(); context.deleteDatabase(database) }
     }
     private fun record(index: Int) = Record("Één 東京 $index", if (index % 2 == 0) "Even" else "Odd", "https://host/live/$index")
+
+    @Test fun indexedSearchPreservesLiteralSubstringsCategoriesAndSourceOrder() = withStore { store ->
+        val first = listOf(
+            Record("NL Sport HD", "Sport", "1"),
+            Record("Één 東京😀 100%_ [HD]", "News", "2"),
+            Record("a\"b OR c*", "News", "3"),
+            Record("x".repeat(300) + "Rare Sport", "Sport", "4"),
+            Record("abc bcd cde", "News", "7"),
+            Record("abcdef", "News", "8")
+        )
+        val second = listOf(Record("Other SPORT", "Sport", "5"), Record("Sports", "News", "6"))
+        store.beginImport("second").use { stage -> second.forEach(stage::add); stage.publish() }
+        store.beginImport("first").use { stage -> first.forEach(stage::add); stage.publish() }
+        val all = first + second
+        val snapshot = store.snapshot(listOf("first", "second"))
+        for (query in listOf("sport", "SPO", "NL Sport HD", "東京😀", "100%_", "%_", " [HD]", "\"b OR", "*", "é", "😀", "abcde", "not found", "Rare Sport", "x".repeat(270), "")) {
+            for (category in listOf(null, "All", "Sport", "News")) {
+                val expected = all.filter { it.name.lowercase().contains(query.lowercase()) && (category == null || category == "All" || it.category == category) }
+                assertEquals("query=$query category=$category", expected, snapshot.filtered(query, category))
+            }
+        }
+    }
+
+    @Test fun cachedResultsAreScopedToSnapshotAndCancelledRequestsAreRejected() = withStore { store ->
+        store.beginImport("source").use { it.add(record(1)); it.publish() }
+        val old = store.snapshot(listOf("source"))
+        val result = old.filtered("ÉÉN")
+        assertSame(result, old.filtered("één", "All"))
+        val signal = CancellationSignal().apply { cancel() }
+        assertThrows(OperationCanceledException::class.java) { old.filtered("één", cancellationSignal = signal) }
+        store.beginImport("source").use { it.add(record(2)); it.publish() }
+        assertEquals(listOf(record(1)), old.filtered("één"))
+        assertEquals(listOf(record(2)), store.snapshot(listOf("source")).filtered("één"))
+    }
+
+    @Test fun existingPlaylistIsIndexedWithoutDownloadingAgain() {
+        val context = InstrumentationRegistry.getInstrumentation().targetContext
+        val database = "playlist-search-upgrade-${UUID.randomUUID()}.db"
+        try {
+            context.openOrCreateDatabase(database, 0, null).use { db ->
+                db.execSQL("CREATE TABLE channels(id INTEGER PRIMARY KEY,generation TEXT NOT NULL,name TEXT NOT NULL,category TEXT NOT NULL,payload TEXT NOT NULL)")
+                db.execSQL("CREATE TABLE active(source TEXT PRIMARY KEY,generation TEXT NOT NULL)")
+                db.execSQL("INSERT INTO active VALUES('source','old')")
+                val payload = com.google.gson.Gson().toJson(Record("Existing Sport", "TV", "1"))
+                db.execSQL("INSERT INTO channels VALUES(1,'old','existing sport','TV',?)", arrayOf(payload))
+            }
+            repeat(2) {
+                PlaylistStore(context, database, Record::class.java, { it.name }, { it.category }).use { store ->
+                    assertEquals("Existing Sport", store.snapshot(listOf("source")).filtered("sport")[0].name)
+                    store.beginImport("failed").use { stage -> repeat(260) { stage.add(record(it)) } }
+                }
+                context.openOrCreateDatabase(database, 0, null).use { db ->
+                    db.rawQuery("SELECT count(*) FROM channel_search_v1", null).use { cursor ->
+                        assertTrue(cursor.moveToFirst()); assertEquals(1, cursor.getInt(0))
+                    }
+                }
+            }
+        } finally { context.deleteDatabase(database) }
+    }
+
+    @Test fun cancellingRunningSqlRemovesTheUnfinishedResultTable() {
+        val context = InstrumentationRegistry.getInstrumentation().targetContext
+        val database = "playlist-search-cancel-${UUID.randomUUID()}.db"
+        try {
+            PlaylistStore(context, database, Record::class.java, { it.name }, { it.category }).use { store ->
+                store.beginImport("source").use { it.add(record(1)); it.publish() }
+                context.openOrCreateDatabase(database, 0, null).use { db ->
+                    val signal = CancellationSignal()
+                    val started = CountDownLatch(1)
+                    val failure = AtomicReference<Throwable>()
+                    val worker = thread(isDaemon = true) {
+                        started.countDown()
+                        try {
+                            // Keep SQLite busy long enough to cancel during query execution.
+                            ChannelList(db, "id IN (WITH RECURSIVE spin(n) AS (SELECT 0 UNION ALL SELECT n+1 FROM spin WHERE n<100000000) SELECT 1 FROM spin)", emptyArray(), com.google.gson.Gson(), Record::class.java, "id", signal)
+                        } catch (caught: Throwable) { failure.set(caught) }
+                    }
+                    try {
+                        assertTrue(started.await(5, TimeUnit.SECONDS))
+                        Thread.sleep(100)
+                    } finally {
+                        signal.cancel()
+                        worker.join(5000)
+                    }
+                    assertFalse("Cancelled SQL is still running", worker.isAlive)
+                    assertTrue("Unexpected failure: ${failure.get()}", failure.get() is OperationCanceledException)
+                    db.rawQuery("SELECT count(*) FROM sqlite_master WHERE name LIKE 'snapshot_%'", null).use {
+                        assertTrue(it.moveToFirst()); assertEquals(0, it.getInt(0))
+                    }
+                }
+            }
+        } finally { context.deleteDatabase(database) }
+    }
 
     @Test fun batchesAndDiskFiltersPreserveEveryRecordAndCategory() = withStore { store ->
         store.beginImport("source").use { stage ->
