@@ -1,3 +1,6 @@
+.\gradlew.bat :app:assembleDebug om debug apk te bouwen!!!
+
+
 # 📺 IPTVMine Pro
 
 [![Kotlin Version](https://img.shields.io/badge/Kotlin-1.9.0-purple.svg?style=flat-square&logo=kotlin)](https://kotlinlang.org/)
