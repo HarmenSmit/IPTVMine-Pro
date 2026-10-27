@@ -29,6 +29,7 @@ class PlaylistStore<T>(
         db.execSQL("CREATE INDEX IF NOT EXISTS channels_generation ON channels(generation, id)")
         db.execSQL("CREATE INDEX IF NOT EXISTS channels_category ON channels(generation, category, id)")
         db.execSQL("CREATE TABLE IF NOT EXISTS active (source TEXT PRIMARY KEY, generation TEXT NOT NULL)")
+        PlaylistCatalogueCache.initialize(db)
         ChannelSearchIndex.initialize(db)
     }
 
@@ -81,7 +82,10 @@ class PlaylistStore<T>(
             db.beginTransaction()
             try {
                 checkCancelled()
+                db.execSQL("INSERT OR REPLACE INTO playlist_generation_counts VALUES(?,?)", arrayOf<Any>(generation, count))
                 db.execSQL("INSERT OR REPLACE INTO active(source,generation) VALUES(?,?)", arrayOf(source, generation))
+                val now = System.currentTimeMillis()
+                db.execSQL("INSERT OR REPLACE INTO playlist_refresh(source,last_success_ms,last_attempt_ms) VALUES(?,?,?)", arrayOf<Any>(source, now, now))
                 db.setTransactionSuccessful()
                 published = true
             } finally { db.endTransaction() }
@@ -97,18 +101,50 @@ class PlaylistStore<T>(
 
     fun beginImport(source: String): Import = Import(source)
 
-    fun count(source: String): Int = DatabaseUtils.longForQuery(db,
-        "SELECT count(*) FROM channels WHERE generation=(SELECT generation FROM active WHERE source=?)", arrayOf(source)).toInt()
+    fun count(source: String): Int {
+        val generation = db.rawQuery("SELECT generation FROM active WHERE source=?", arrayOf(source)).use { if (it.moveToFirst()) it.getString(0) else null }
+        return generation?.let { PlaylistCatalogueCache.count(db, it) } ?: 0
+    }
 
-    fun snapshot(sources: List<String>): ChannelList<T> {
+    fun recordRefreshAttempt(source: String, now: Long = System.currentTimeMillis()) {
+        db.execSQL("INSERT OR IGNORE INTO playlist_refresh(source) VALUES(?)", arrayOf(source))
+        db.execSQL("UPDATE playlist_refresh SET last_attempt_ms=? WHERE source=?", arrayOf<Any>(now, source))
+    }
+
+    fun needsRefresh(source: String, maxAgeMs: Long, now: Long = System.currentTimeMillis()): Boolean {
+        db.rawQuery("SELECT r.last_success_ms,r.last_attempt_ms,a.generation FROM playlist_refresh r LEFT JOIN active a ON a.source=r.source WHERE r.source=?", arrayOf(source)).use { cursor ->
+            if (!cursor.moveToFirst()) return true
+            val success = cursor.getLong(0)
+            val attempt = cursor.getLong(1)
+            if (!cursor.isNull(2) && success > 0 && now >= success && now - success < maxAgeMs) return false
+            // Persist a short retry delay too, so restarting cannot hammer a failing provider.
+            return attempt == 0L || now < attempt || now - attempt >= 60_000L
+        }
+    }
+
+    private var cachedGenerations: List<String>? = null
+    private var cachedSnapshot: ChannelList<T>? = null
+
+    @Synchronized fun snapshot(sources: List<String>): ChannelList<T> {
         val generations = sources.mapNotNull { source ->
             db.rawQuery("SELECT generation FROM active WHERE source=?", arrayOf(source)).use { if (it.moveToFirst()) it.getString(0) else null }
-        }
+        }.distinct()
+        if (generations == cachedGenerations) cachedSnapshot?.let { return it }
         val selection = if (generations.isEmpty()) "0" else "generation IN (${generations.joinToString(",") { "?" }})"
         val order = if (generations.isEmpty()) "id" else "CASE generation " + generations.mapIndexed { index, generation ->
             "WHEN '$generation' THEN $index"
         }.joinToString(" ") + " END,id"
-        return ChannelList(db, selection, generations.toTypedArray(), gson, type, order)
+        val view = PlaylistCatalogueCache.getOrBuild(db, "channels-v1", generations) { table ->
+            db.execSQL("CREATE TABLE $table (position INTEGER PRIMARY KEY,channelId INTEGER NOT NULL)")
+            // Concatenating the generations avoids sorting the whole catalogue with CASE.
+            generations.forEach { generation ->
+                db.execSQL("INSERT INTO $table(channelId) SELECT id FROM channels WHERE generation=? ORDER BY id", arrayOf(generation))
+            }
+        }
+        return ChannelList(db, selection, generations.toTypedArray(), gson, type, order, persistentView = view, rootGenerations = generations).also {
+            cachedGenerations = generations
+            cachedSnapshot = it
+        }
     }
 
     /** Delete obsolete generations only when this owner and its UI snapshots have gone away. */
@@ -124,45 +160,51 @@ class ChannelList<T> internal constructor(
     private val gson: Gson,
     private val type: Class<T>,
     private val order: String,
-    cancellationSignal: CancellationSignal? = null
+    cancellationSignal: CancellationSignal? = null,
+    persistentView: PlaylistCatalogueCache.View? = null,
+    private val rootGenerations: List<String>? = null
 ) : AbstractList<T>() {
-    private val table = "snapshot_" + UUID.randomUUID().toString().replace("-", "")
+    private val table = persistentView?.table ?: ("snapshot_" + UUID.randomUUID().toString().replace("-", ""))
     override val size: Int
     init {
-        // The ordinal index lives on disk. Random UI access never scans an ever-growing OFFSET.
-        db.execSQL("CREATE TABLE $table (position INTEGER PRIMARY KEY, channelId INTEGER NOT NULL)")
-        try {
-            size = if (cancellationSignal == null) {
-                db.execSQL("INSERT INTO $table(channelId) SELECT id FROM channels WHERE $selection ORDER BY $order", args)
-                DatabaseUtils.longForQuery(db, "SELECT count(*) FROM $table", null).toInt()
-            } else {
-                // execSQL(INSERT ... SELECT) cannot be cancelled. Read with a CancellationSignal
-                // and build the ordinal snapshot in a transaction, checking cancellation per row.
-                cancellationSignal.throwIfCanceled()
-                db.beginTransactionNonExclusive()
-                try {
-                    var count = 0
-                    db.compileStatement("INSERT INTO $table(channelId) VALUES(?)").use { insert ->
-                        db.rawQuery("SELECT id FROM channels WHERE $selection ORDER BY $order", args, cancellationSignal).use { cursor ->
-                            while (cursor.moveToNext()) {
-                                cancellationSignal.throwIfCanceled()
-                                insert.bindLong(1, cursor.getLong(0))
-                                insert.executeInsert()
-                                count++
+        if (persistentView != null) {
+            size = persistentView.size
+        } else {
+            // The ordinal index lives on disk. Random UI access never scans an ever-growing OFFSET.
+            db.execSQL("CREATE TABLE $table (position INTEGER PRIMARY KEY, channelId INTEGER NOT NULL)")
+            try {
+                size = if (cancellationSignal == null) {
+                    db.execSQL("INSERT INTO $table(channelId) SELECT id FROM channels WHERE $selection ORDER BY $order", args)
+                    DatabaseUtils.longForQuery(db, "SELECT count(*) FROM $table", null).toInt()
+                } else {
+                    // execSQL(INSERT ... SELECT) cannot be cancelled. Read with a CancellationSignal
+                    // and build the ordinal snapshot in a transaction, checking cancellation per row.
+                    cancellationSignal.throwIfCanceled()
+                    db.beginTransactionNonExclusive()
+                    try {
+                        var count = 0
+                        db.compileStatement("INSERT INTO $table(channelId) VALUES(?)").use { insert ->
+                            db.rawQuery("SELECT id FROM channels WHERE $selection ORDER BY $order", args, cancellationSignal).use { cursor ->
+                                while (cursor.moveToNext()) {
+                                    cancellationSignal.throwIfCanceled()
+                                    insert.bindLong(1, cursor.getLong(0))
+                                    insert.executeInsert()
+                                    count++
+                                }
                             }
                         }
+                        cancellationSignal.throwIfCanceled()
+                        db.setTransactionSuccessful()
+                        count
+                    } finally {
+                        db.endTransaction()
                     }
-                    cancellationSignal.throwIfCanceled()
-                    db.setTransactionSuccessful()
-                    count
-                } finally {
-                    db.endTransaction()
                 }
+                PlaylistDatabases.register(db, table, this)
+            } catch (failure: Exception) {
+                db.execSQL("DROP TABLE IF EXISTS $table")
+                throw failure
             }
-            PlaylistDatabases.register(db, table, this)
-        } catch (failure: Exception) {
-            db.execSQL("DROP TABLE IF EXISTS $table")
-            throw failure
         }
     }
     private val cache = object : LinkedHashMap<Int, T>(16, .75f, true) {}
@@ -218,9 +260,15 @@ class ChannelList<T> internal constructor(
         return result
     }
 
-    fun categoryCounts(): List<Pair<String, Int>> = SqlList(db,
-        "SELECT category,count(*) FROM channels WHERE $selection GROUP BY category ORDER BY category", args
-    ) { it.getString(0) to it.getInt(1) }
+    private var cachedCategoryCounts: List<Pair<String, Int>>? = null
+    @Synchronized fun categoryCounts(): List<Pair<String, Int>> {
+        cachedCategoryCounts?.let { return it }
+        val sql = "SELECT category,count(*) FROM channels WHERE $selection GROUP BY category ORDER BY category"
+        val view = rootGenerations?.let { generations ->
+            PlaylistCatalogueCache.getOrBuild(db, "categories-v1", generations) { table -> db.execSQL("CREATE TABLE $table AS $sql", args) }
+        }
+        return SqlList(db, sql, args, view) { it.getString(0) to it.getInt(1) }.also { cachedCategoryCounts = it }
+    }
 
     // StateFlow/Compose must not compare every record in two large snapshots.
     override fun equals(other: Any?) = this === other
@@ -228,14 +276,18 @@ class ChannelList<T> internal constructor(
 }
 
 private class SqlList<T>(
-    private val db: SQLiteDatabase, private val sql: String, private val args: Array<String>, private val decode: (Cursor) -> T
+    private val db: SQLiteDatabase, private val sql: String, private val args: Array<String>, persistentView: PlaylistCatalogueCache.View? = null, private val decode: (Cursor) -> T
 ) : AbstractList<T>() {
-    private val table = "snapshot_" + UUID.randomUUID().toString().replace("-", "")
+    private val table = persistentView?.table ?: ("snapshot_" + UUID.randomUUID().toString().replace("-", ""))
     override val size: Int
     init {
-        db.execSQL("CREATE TABLE $table AS $sql", args)
-        size = DatabaseUtils.longForQuery(db, "SELECT count(*) FROM $table", null).toInt()
-        PlaylistDatabases.register(db, table, this)
+        if (persistentView != null) {
+            size = persistentView.size
+        } else {
+            db.execSQL("CREATE TABLE $table AS $sql", args)
+            size = DatabaseUtils.longForQuery(db, "SELECT count(*) FROM $table", null).toInt()
+            PlaylistDatabases.register(db, table, this)
+        }
     }
     override fun get(index: Int): T {
         if (index !in 0 until size) throw IndexOutOfBoundsException()
@@ -289,7 +341,10 @@ private object PlaylistDatabases {
             for (table in tables) if (Regex("snapshot_[a-f0-9]+").matches(table)) db.execSQL("DROP TABLE $table")
         }
         db.rawQuery("SELECT count(*) FROM sqlite_master WHERE type='table' AND name='active'", null).use {
-            if (it.moveToFirst() && it.getInt(0) > 0) db.execSQL("DELETE FROM channels WHERE generation NOT IN (SELECT generation FROM active)")
+            if (it.moveToFirst() && it.getInt(0) > 0) {
+                PlaylistCatalogueCache.pruneObsolete(db)
+                pruneChannels(db)
+            }
         }
         return Lease(path, db).also { leases[path] = it }
     }
@@ -308,10 +363,28 @@ private object PlaylistDatabases {
         if (--lease.owners > 0) return
         try {
             for (table in lease.snapshots.keys) lease.database.execSQL("DROP TABLE IF EXISTS $table")
-            lease.database.execSQL("DELETE FROM channels WHERE generation NOT IN (SELECT generation FROM active)")
+            PlaylistCatalogueCache.pruneObsolete(lease.database)
+            pruneChannels(lease.database)
         } finally {
             lease.database.close()
             leases.remove(lease.path)
+        }
+    }
+
+    private fun pruneChannels(db: SQLiteDatabase) {
+        val active = mutableSetOf<String>()
+        db.rawQuery("SELECT generation FROM active", null).use { while (it.moveToNext()) active.add(it.getString(0)) }
+        var previous: String? = null
+        while (true) {
+            // Seek to the next generation through the existing index. A NOT IN delete would
+            // scan every channel even on a normal startup with nothing to remove.
+            val generation = (if (previous == null) {
+                db.rawQuery("SELECT generation FROM channels ORDER BY generation LIMIT 1", null)
+            } else {
+                db.rawQuery("SELECT generation FROM channels WHERE generation>? ORDER BY generation LIMIT 1", arrayOf(previous))
+            }).use { if (it.moveToFirst()) it.getString(0) else null } ?: break
+            if (generation !in active) db.delete("channels", "generation=?", arrayOf(generation))
+            previous = generation
         }
     }
 }

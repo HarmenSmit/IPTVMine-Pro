@@ -28,6 +28,90 @@ class PlaylistStoreTest {
     }
     private fun record(index: Int) = Record("Één 東京 $index", if (index % 2 == 0) "Even" else "Odd", "https://host/live/$index")
 
+    @Test fun catalogueAndCategoryTotalsAreReusedAfterRestart() {
+        val context = InstrumentationRegistry.getInstrumentation().targetContext
+        val database = "playlist-startup-${UUID.randomUUID()}.db"
+        fun open() = PlaylistStore(context, database, Record::class.java, { it.name }, { it.category })
+        try {
+            open().use { store ->
+                store.beginImport("source").use { stage -> repeat(1003) { stage.add(record(it)) }; stage.publish() }
+                val snapshot = store.snapshot(listOf("source"))
+                assertSame(snapshot, store.snapshot(listOf("source")))
+                assertEquals(listOf("Even" to 502, "Odd" to 501), snapshot.categoryCounts())
+                assertSame(snapshot.categoryCounts(), snapshot.categoryCounts())
+                assertEquals(1003, store.count("source"))
+            }
+            context.openOrCreateDatabase(database, 0, null).use { db ->
+                db.rawQuery("SELECT count(*) FROM playlist_views", null).use { assertTrue(it.moveToFirst()); assertEquals(2, it.getInt(0)) }
+                // A cache miss on the next process-style reopen would try to write this metadata.
+                db.execSQL("CREATE TRIGGER forbid_cache_rebuild BEFORE INSERT ON playlist_views BEGIN SELECT RAISE(FAIL,'Unexpected catalogue rebuild'); END")
+            }
+            open().use { store ->
+                val snapshot = store.snapshot(listOf("source"))
+                assertEquals(1003, snapshot.size)
+                assertEquals(record(1002), snapshot[1002])
+                assertEquals(listOf("Even" to 502, "Odd" to 501), snapshot.categoryCounts())
+                assertEquals(1003, store.count("source"))
+            }
+        } finally { context.deleteDatabase(database) }
+    }
+
+    @Test fun persistentRefreshTimesArePerSourceAndFailedAttemptsDoNotMarkSuccess() {
+        val context = InstrumentationRegistry.getInstrumentation().targetContext
+        val database = "playlist-refresh-${UUID.randomUUID()}.db"
+        fun open() = PlaylistStore(context, database, Record::class.java, { it.name }, { it.category })
+        val maxAge = 30 * 60 * 1000L
+        try {
+            var firstRefresh = 0L
+            open().use { store ->
+                assertTrue(store.needsRefresh("first", maxAge))
+                store.beginImport("first").use { it.add(record(1)); it.publish() }
+                store.beginImport("second").use { it.add(record(2)); it.publish() }
+                context.openOrCreateDatabase(database, 0, null).use { db ->
+                    db.rawQuery("SELECT last_success_ms FROM playlist_refresh WHERE source='first'", null).use { assertTrue(it.moveToFirst()); firstRefresh = it.getLong(0) }
+                }
+                assertFalse(store.needsRefresh("first", maxAge, firstRefresh + maxAge - 1))
+                assertTrue(store.needsRefresh("first", maxAge, firstRefresh + maxAge))
+                assertTrue(store.needsRefresh("first", maxAge, firstRefresh - 1))
+                store.recordRefreshAttempt("first", firstRefresh + maxAge)
+                store.beginImport("first").use { it.add(record(3)) } // Failed/cancelled update.
+                assertFalse(store.needsRefresh("first", maxAge, firstRefresh + maxAge + 30_000L))
+                assertTrue(store.needsRefresh("first", maxAge, firstRefresh + maxAge + 60_000L))
+                assertFalse(store.needsRefresh("second", maxAge))
+            }
+            open().use { store ->
+                assertFalse(store.needsRefresh("first", maxAge, firstRefresh + maxAge + 30_000L))
+                assertTrue(store.needsRefresh("first", maxAge, firstRefresh + maxAge + 60_000L))
+                assertEquals(listOf(record(1)), store.snapshot(listOf("first")))
+                assertFalse(store.needsRefresh("second", maxAge))
+            }
+        } finally { context.deleteDatabase(database) }
+    }
+
+    @Test fun changedGenerationInvalidatesCachedViewsAndOldReadersStayValid() {
+        val context = InstrumentationRegistry.getInstrumentation().targetContext
+        val database = "playlist-view-replace-${UUID.randomUUID()}.db"
+        fun open() = PlaylistStore(context, database, Record::class.java, { it.name }, { it.category })
+        try {
+            open().use { store ->
+                store.beginImport("source").use { it.add(record(1)); it.publish() }
+                val previous = store.snapshot(listOf("source"))
+                val previousTotals = previous.categoryCounts()
+                store.beginImport("source").use { it.add(record(2)); it.publish() }
+                val current = store.snapshot(listOf("source"))
+                assertNotSame(previous, current)
+                assertEquals(listOf(record(1)), previous)
+                assertEquals(listOf("Odd" to 1), previousTotals)
+                assertEquals(listOf(record(2)), current)
+                assertEquals(listOf("Even" to 1), current.categoryCounts())
+            }
+            context.openOrCreateDatabase(database, 0, null).use { db ->
+                db.rawQuery("SELECT count(*) FROM playlist_views", null).use { assertTrue(it.moveToFirst()); assertEquals(2, it.getInt(0)) }
+            }
+            open().use { store -> assertEquals(listOf(record(2)), store.snapshot(listOf("source"))) }
+        } finally { context.deleteDatabase(database) }
+    }
+
     @Test fun indexedSearchPreservesLiteralSubstringsCategoriesAndSourceOrder() = withStore { store ->
         val first = listOf(
             Record("NL Sport HD", "Sport", "1"),

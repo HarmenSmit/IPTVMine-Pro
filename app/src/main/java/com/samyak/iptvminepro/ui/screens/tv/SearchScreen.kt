@@ -37,6 +37,7 @@ fun SearchScreen(
     val allChannels by viewModel.channels.observeAsState(emptyList())
     val categories by viewModel.categories.observeAsState(emptyList())
     val isLoading by viewModel.isLoading.observeAsState(false)
+    val isManualRefreshing by viewModel.isManualRefreshing.observeAsState(false)
     val errorMessage by viewModel.error.observeAsState(null)
 
     var searchQuery by rememberSaveable { mutableStateOf("") }
@@ -132,10 +133,12 @@ fun SearchScreen(
             // Content Area
             Box(modifier = Modifier.fillMaxSize()) {
                 if (isLoading && channels.isEmpty()) {
-                    CircularProgressIndicator(
-                        modifier = Modifier.align(Alignment.Center),
-                        color = MaterialTheme.colorScheme.primary
-                    )
+                    if (isManualRefreshing || allChannels.isEmpty()) {
+                        CircularProgressIndicator(
+                            modifier = Modifier.align(Alignment.Center),
+                            color = MaterialTheme.colorScheme.primary
+                        )
+                    }
                 } else if (!errorMessage.isNullOrEmpty() && channels.isEmpty()) {
                     Column(
                         modifier = Modifier.align(Alignment.Center).padding(16.dp),
@@ -184,8 +187,7 @@ fun SearchScreen(
                     }
                 }
                 
-                // Overlay loading indicator for background fetches
-                if (isLoading && channels.isNotEmpty()) {
+                if (isManualRefreshing && channels.isNotEmpty()) {
                     LinearProgressIndicator(
                         modifier = Modifier.fillMaxWidth().align(Alignment.TopCenter),
                         color = MaterialTheme.colorScheme.primary

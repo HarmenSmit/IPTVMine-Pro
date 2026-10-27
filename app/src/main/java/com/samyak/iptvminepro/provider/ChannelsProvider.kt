@@ -46,6 +46,8 @@ class ChannelsProvider(application: Application) : AndroidViewModel(application)
 
     private val _isLoading = MutableLiveData<Boolean>(false)
     val isLoading: LiveData<Boolean> get() = _isLoading
+    private val _isManualRefreshing = MutableLiveData(false)
+    val isManualRefreshing: LiveData<Boolean> get() = _isManualRefreshing
 
     private val _providerChannelCounts = MutableLiveData<Map<String, Int>>(emptyMap())
     val providerChannelCounts: LiveData<Map<String, Int>> get() = _providerChannelCounts
@@ -56,9 +58,9 @@ class ChannelsProvider(application: Application) : AndroidViewModel(application)
     private val notificationHelper = NotificationHelper(application)
     private var notificationCount = 0
 
-    // Fetch cooldown: prevent repeated network requests
-    private var lastFetchTimestamp = 0L
-    private var lastFetchedUrlsHash = 0
+    // Suppress duplicate screen-entry checks; provider freshness is persisted in SQLite.
+    private var lastLoadCheckTimestamp = 0L
+    private var lastRequestedUrls: List<String>? = null
 
     /**
      * Per-URL failure backoff. Prevents repeated connection attempts (and wasted mobile data)
@@ -188,41 +190,34 @@ class ChannelsProvider(application: Application) : AndroidViewModel(application)
      * Use this for automatic/screen-entry fetches. Use [fetchM3UFile] for explicit user-triggered refreshes.
      */
     fun loadIfNeeded() {
+        refreshProviders()
+        val urls = getSourceUrls()
         val now = System.currentTimeMillis()
-        val currentUrlsHash = synchronized(sourceUrls) { sourceUrls.hashCode() }
-        val withinCooldown = (now - lastFetchTimestamp) < FETCH_COOLDOWN_MS
-        val urlsUnchanged = currentUrlsHash == lastFetchedUrlsHash
-        val fetchAttempted = lastFetchTimestamp != 0L
-
-        // Skip if we already attempted a fetch recently for the same set of URLs — regardless of
-        // whether it succeeded. This is critical: if every source is failing, _channels stays empty,
-        // and re-fetching on every screen entry would hammer the failing URLs and burn mobile data.
-        if (fetchAttempted && withinCooldown && urlsUnchanged) {
-            Log.d(TAG, "loadIfNeeded: skipping fetch — recent attempt, cooldown active, URLs unchanged")
-            return
-        }
-        fetchM3UFile()
+        val unchanged = urls == lastRequestedUrls
+        if (unchanged && (fetchJob?.isActive == true || (now >= lastLoadCheckTimestamp && now - lastLoadCheckTimestamp < 30_000L))) return
+        startFetch(urls, respectBackoff = true, manual = false)
     }
 
     fun fetchM3UFile(forceRefresh: Boolean = false) {
         refreshProviders()
         if (forceRefresh) sourceFailureStates.clear()
-        startFetch(getSourceUrls(), respectBackoff = !forceRefresh)
+        startFetch(getSourceUrls(), respectBackoff = !forceRefresh, manual = true)
     }
 
     fun fetchFromSingleSource(sourceUrl: String) {
         sourceFailureStates.remove(sourceUrl)
-        startFetch(listOf(sourceUrl), respectBackoff = false)
+        startFetch(listOf(sourceUrl), respectBackoff = false, manual = true)
     }
 
-    private fun startFetch(urls: List<String>, respectBackoff: Boolean) {
+    private fun startFetch(urls: List<String>, respectBackoff: Boolean, manual: Boolean) {
         val previous = fetchJob
         previous?.cancel()
         filterJob?.cancel()
         filterCancellationSignal?.cancel()
-        lastFetchTimestamp = System.currentTimeMillis()
-        lastFetchedUrlsHash = urls.hashCode()
+        lastLoadCheckTimestamp = System.currentTimeMillis()
+        lastRequestedUrls = urls.toList()
         _isLoading.value = true
+        _isManualRefreshing.value = manual
         fetchJob = viewModelScope.launch(Dispatchers.IO) {
             // SQLite imports are serialized; cancellation finishes rollback before the next import.
             previous?.join()
@@ -232,13 +227,15 @@ class ChannelsProvider(application: Application) : AndroidViewModel(application)
             try {
                 // Cached generations remain available during download and after a failed update.
                 publishSnapshot(urls)
-                for ((index, source) in urls.withIndex()) {
+                val due = urls.filter { manual || playlistStore.needsRefresh(it, FETCH_COOLDOWN_MS) }
+                for ((index, source) in due.withIndex()) {
                     ensureActive()
                     if (respectBackoff && isInBackoff(source, System.currentTimeMillis())) {
                         failures.append("Source ${index + 1}: Temporarily skipped (retry in ${backoffRemainingSeconds(source, System.currentTimeMillis())}s).\n")
                         continue
                     }
                     try {
+                        playlistStore.recordRefreshAttempt(source)
                         importSource(source)
                         recordSourceSuccess(source)
                         successes++
@@ -260,11 +257,11 @@ class ChannelsProvider(application: Application) : AndroidViewModel(application)
                         Log.w(TAG, "Source ${index + 1} import failed (${failure.javaClass.simpleName}); previous playlist retained")
                     }
                 }
-                publishSnapshot(urls)
+                if (successes > 0) publishSnapshot(urls)
                 withContext(Dispatchers.Main) {
                     _error.value = when {
                         urls.isEmpty() -> "No source URLs configured"
-                        failures.isNotEmpty() -> "Loaded $successes/${urls.size} sources. Previous data retained for failed sources.\n$failures"
+                        failures.isNotEmpty() -> "Updated $successes/${due.size} sources. Previous data retained for failed sources.\n$failures"
                         else -> null
                     }
                 }
@@ -275,7 +272,10 @@ class ChannelsProvider(application: Application) : AndroidViewModel(application)
                 withContext(Dispatchers.Main) { _error.value = "Unable to read or update playlist storage. Previous data retained." }
             } finally {
                 withContext(NonCancellable + Dispatchers.Main) {
-                    if (fetchJob === ownJob) _isLoading.value = false
+                    if (fetchJob === ownJob) {
+                        _isLoading.value = false
+                        _isManualRefreshing.value = false
+                    }
                 }
             }
         }
@@ -336,12 +336,17 @@ class ChannelsProvider(application: Application) : AndroidViewModel(application)
 
     private suspend fun publishSnapshot(urls: List<String>) {
         val snapshot = playlistStore.snapshot(urls)
+        // Show stored channels before any category work or network request.
+        withContext(Dispatchers.Main) {
+            if (_channels.value !== snapshot) {
+                _channels.value = snapshot
+                _filteredChannels.value = snapshot
+            }
+        }
         val counts = snapshot.categoryCounts()
         val categories = counts.project { it.first }.withAll("All")
         val sourceCounts = urls.associateWith { playlistStore.count(it) }
         withContext(Dispatchers.Main) {
-            _channels.value = snapshot
-            _filteredChannels.value = snapshot
             _categories.value = if (snapshot.isEmpty()) emptyList() else categories
             _categoryCounts.value = counts
             _providerChannelCounts.value = sourceCounts

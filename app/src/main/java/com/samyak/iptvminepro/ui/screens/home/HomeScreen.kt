@@ -48,6 +48,7 @@ fun HomeScreen(
     val context = LocalContext.current
     val channels by viewModel.channels.observeAsState(emptyList())
     val isLoading by viewModel.isLoading.observeAsState(false)
+    val isManualRefreshing by viewModel.isManualRefreshing.observeAsState(false)
     val errorMessage by viewModel.error.observeAsState(null)
 
     // User-added direct video URLs (grouped into a single "My Videos" home card).
@@ -81,7 +82,7 @@ fun HomeScreen(
             .background(MaterialTheme.colorScheme.background)
     ) {
         Box(modifier = Modifier.fillMaxSize()) {
-            if ((isLoading && channels.isEmpty()) || (isMoviesLoading && moviesByCategory.isEmpty())) {
+            if (isLoading && channels.isEmpty() && moviesByCategory.isEmpty() && videoProviders.isEmpty()) {
                 com.samyak.iptvminepro.ui.components.HomeShimmerPlaceholder(
                     modifier = Modifier.align(Alignment.TopCenter)
                 )
@@ -222,8 +223,8 @@ fun HomeScreen(
                 }
             }
 
-            // Overlay loading indicator for background fetches
-            if ((isLoading && channels.isNotEmpty()) || (isMoviesLoading && moviesByCategory.isNotEmpty())) {
+            // Automatic updates stay quiet and never hide existing content.
+            if (isManualRefreshing && (channels.isNotEmpty() || moviesByCategory.isNotEmpty() || videoProviders.isNotEmpty())) {
                 LinearProgressIndicator(
                     modifier = Modifier.fillMaxWidth().align(Alignment.TopCenter),
                     color = MaterialTheme.colorScheme.primary

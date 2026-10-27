@@ -63,6 +63,7 @@ fun CategoryScreen(
     // Live TV states
     val channels by channelsViewModel.channels.observeAsState(emptyList())
     val isTvLoading by channelsViewModel.isLoading.observeAsState(false)
+    val isManualRefreshing by channelsViewModel.isManualRefreshing.observeAsState(false)
     val tvErrorMessage by channelsViewModel.error.observeAsState(null)
 
     LaunchedEffect(Unit) {
@@ -216,6 +217,7 @@ fun CategoryScreen(
                     LiveTvCategoriesContent(
                         channels = channels,
                         isTvLoading = isTvLoading,
+                        isManualRefreshing = isManualRefreshing,
                         tvErrorMessage = tvErrorMessage,
                         categoriesWithCount = tvCategoriesWithCount,
                         onTvCategoryClick = onTvCategoryClick
@@ -392,6 +394,7 @@ private fun MovieCategoriesContent(
 private fun LiveTvCategoriesContent(
     channels: List<Channel>,
     isTvLoading: Boolean,
+    isManualRefreshing: Boolean,
     tvErrorMessage: String?,
     categoriesWithCount: List<Pair<String, Int>>,
     onTvCategoryClick: (String) -> Unit
@@ -460,7 +463,7 @@ private fun LiveTvCategoriesContent(
             }
         }
 
-        if (isTvLoading && channels.isNotEmpty()) {
+        if (isManualRefreshing && channels.isNotEmpty()) {
             LinearProgressIndicator(
                 modifier = Modifier
                     .fillMaxWidth()

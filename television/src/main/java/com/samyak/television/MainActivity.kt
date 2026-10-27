@@ -13,6 +13,7 @@ import androidx.compose.foundation.lazy.grid.items
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material3.CircularProgressIndicator
+import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.OutlinedTextFieldDefaults
 import androidx.compose.runtime.*
@@ -81,8 +82,10 @@ fun TelevisionApp(viewModel: TelevisionViewModel = viewModel()) {
     }.collectAsState(initial = NetworkUtils.isNetworkAvailable(context))
 
     val channels by viewModel.filteredChannels.collectAsState()
+    val allChannels by viewModel.channels.collectAsState()
     val categories by viewModel.categories.collectAsState()
     val isLoading by viewModel.isLoading.collectAsState()
+    val isManualRefreshing by viewModel.isManualRefreshing.collectAsState()
     val errorMessage by viewModel.errorMessage.collectAsState()
     val selectedCategory by viewModel.selectedCategory.collectAsState()
 
@@ -92,7 +95,7 @@ fun TelevisionApp(viewModel: TelevisionViewModel = viewModel()) {
     var activeScreenIndex by remember { mutableStateOf(1) } // Default to Movies & Shows for a rich experience!
     // activeScreenIndex == 0: Live TV Grid (categories)
     // activeScreenIndex == 1: VOD Movies & Shows catalog
-    // activeScreenIndex == 2: Search Movies Screen
+    // activeScreenIndex == 2: Search channels or movies
     // activeScreenIndex == 3: Manage Extensions
     // activeScreenIndex == 4: Manage Playlists/Providers
     // activeScreenIndex == 5: Speed Test Screen
@@ -343,8 +346,11 @@ fun TelevisionApp(viewModel: TelevisionViewModel = viewModel()) {
                         ExtensionsScreen()
                     }
                     2 -> {
-                        // Search Movies screen
-                        SearchMoviesScreen(
+                        SearchScreen(
+                            viewModel = viewModel,
+                            onChannelClick = { channel ->
+                                com.samyak.player.PlayerActivity.start(context, channel.name, channel.streamUrl)
+                            },
                             onMovieClick = { movie, scraper, provider ->
                                 selectedMovieLink = movie.link
                                 selectedMovieScraper = scraper
@@ -440,7 +446,10 @@ fun TelevisionApp(viewModel: TelevisionViewModel = viewModel()) {
                                     modifier = Modifier.padding(bottom = 16.dp, end = 100.dp)
                                 )
 
-                                if (isLoading) {
+                                if (isManualRefreshing && filteredChannels.isNotEmpty()) {
+                                    LinearProgressIndicator(modifier = Modifier.fillMaxWidth().padding(end = 100.dp), color = Color(0xFF26A69A))
+                                }
+                                if ((isManualRefreshing || (isLoading && allChannels.isEmpty())) && filteredChannels.isEmpty()) {
                                     Box(
                                         modifier = Modifier.fillMaxSize(),
                                         contentAlignment = Alignment.Center
@@ -458,7 +467,7 @@ fun TelevisionApp(viewModel: TelevisionViewModel = viewModel()) {
                                             fontSize = 14.sp
                                         )
                                     }
-                                } else if (filteredChannels.isEmpty()) {
+                                } else if (filteredChannels.isEmpty() && !isLoading) {
                                     Box(
                                         modifier = Modifier.fillMaxSize(),
                                         contentAlignment = Alignment.Center

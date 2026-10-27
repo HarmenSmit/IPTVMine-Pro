@@ -26,6 +26,7 @@ fun CategoryDetailScreen(
     val channels by viewModel.channels.observeAsState(emptyList())
     val filteredChannels by viewModel.filteredChannels.observeAsState(emptyList())
     val isLoading by viewModel.isLoading.observeAsState(false)
+    val isManualRefreshing by viewModel.isManualRefreshing.observeAsState(false)
     val context = androidx.compose.ui.platform.LocalContext.current
 
     // Hoist resource string so it isn't queried via LocalContext inside the click lambda
@@ -74,7 +75,7 @@ fun CategoryDetailScreen(
             }
         }
 
-        if (isLoading) {
+        if (isManualRefreshing || (isLoading && channels.isEmpty())) {
             CircularProgressIndicator(
                 modifier = Modifier.align(Alignment.Center),
                 color = MaterialTheme.colorScheme.primary

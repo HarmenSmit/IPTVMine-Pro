@@ -41,6 +41,7 @@ fun TelevisionScreen(
     val allChannels by viewModel.channels.observeAsState(emptyList())
     val categories by viewModel.categories.observeAsState(emptyList())
     val isLoading by viewModel.isLoading.observeAsState(false)
+    val isManualRefreshing by viewModel.isManualRefreshing.observeAsState(false)
     val errorMessage by viewModel.error.observeAsState(null)
 
     var selectedCategory by remember { mutableStateOf("All") }
@@ -98,10 +99,12 @@ fun TelevisionScreen(
                 .weight(1f)
         ) {
             if (isLoading && channels.isEmpty()) {
-                CircularProgressIndicator(
-                    modifier = Modifier.align(Alignment.Center),
-                    color = MaterialTheme.colorScheme.primary
-                )
+                if (isManualRefreshing || allChannels.isEmpty()) {
+                    CircularProgressIndicator(
+                        modifier = Modifier.align(Alignment.Center),
+                        color = MaterialTheme.colorScheme.primary
+                    )
+                }
             } else if (!errorMessage.isNullOrEmpty() && channels.isEmpty()) {
                 Column(
                     modifier = Modifier
@@ -189,8 +192,7 @@ fun TelevisionScreen(
                 }
             }
 
-            // Overlay linear progress indicator for background loading
-            if (isLoading && channels.isNotEmpty()) {
+            if (isManualRefreshing && channels.isNotEmpty()) {
                 LinearProgressIndicator(
                     modifier = Modifier
                         .fillMaxWidth()
