@@ -9,15 +9,13 @@ import androidx.lifecycle.viewModelScope
 import com.samyak.iptvminepro.model.Channel
 import com.samyak.iptvminepro.utils.ContentFilter
 import kotlinx.coroutines.*
-import java.io.BufferedReader
-import java.io.InputStreamReader
-import java.net.HttpURLConnection
+import java.io.IOException
 import java.net.URL
+import com.samyak.playlist.*
 import org.json.JSONObject
 import org.json.JSONArray
 import com.samyak.iptvminepro.notification.NotificationHelper
 import com.samyak.iptvminepro.model.Provider
-import com.samyak.iptvminepro.provider.ChannelsProvider.Companion.DEFAULT_LOGO_URL
 
 class ChannelsProvider(application: Application) : AndroidViewModel(application) {
 
@@ -25,6 +23,11 @@ class ChannelsProvider(application: Application) : AndroidViewModel(application)
     val providers: LiveData<List<Provider>> get() = _providers
 
     private val repository = ProviderRepository(application)
+    private val playlistStoreDelegate = lazy { PlaylistStore(application, "iptv-channels.db", Channel::class.java, { it.name }, { it.category }) }
+    private val playlistStore by playlistStoreDelegate
+    private val _categoryCounts = MutableLiveData<List<Pair<String, Int>>>(emptyList())
+    val categoryCounts: LiveData<List<Pair<String, Int>>> get() = _categoryCounts
+    private var filterJob: Job? = null
 
     private val _channels = MutableLiveData<List<Channel>>(emptyList())
     val channels: LiveData<List<Channel>> get() = _channels
@@ -81,25 +84,7 @@ class ChannelsProvider(application: Application) : AndroidViewModel(application)
         // Exponential backoff: BASE * 2^(n-1), capped at MAX_BACKOFF_MS
         val delay = (BASE_BACKOFF_MS shl minOf(newCount - 1, 6)).coerceAtMost(MAX_BACKOFF_MS)
         sourceFailureStates[url] = FailureState(newCount, System.currentTimeMillis() + delay)
-        Log.w(TAG, "Source failed ($newCount consecutive) — backing off ${delay / 1000}s: $url")
-    }
-
-    /**
-     * Decide whether a response Content-Type is a real media/binary file that should be
-     * rejected (to avoid downloading videos into memory). M3U/M3U8 playlists are frequently
-     * served as audio/x-mpegurl, application/x-mpegurl, or application/octet-stream, so those
-     * must be allowed. Only genuine video/image/audio-media types are blocked.
-     */
-    private fun isBlockedContentType(rawContentType: String?): Boolean {
-        val ct = rawContentType?.lowercase()?.substringBefore(";")?.trim().orEmpty()
-        if (ct.isEmpty()) return false                       // unknown — allow, size caps protect us
-        if (PLAYLIST_CONTENT_TYPES.contains(ct)) return false // explicit playlist types
-        if (ct.contains("mpegurl")) return false             // any *mpegurl* variant is a playlist
-        if (ct.startsWith("text/")) return false             // text/plain, text/html playlists
-        if (ct == "application/json" || ct.endsWith("+json")) return false
-        if (ct == "application/xml" || ct.endsWith("+xml")) return false
-        // Block genuine media files that would waste data / memory
-        return ct.startsWith("video/") || ct.startsWith("image/") || ct.startsWith("audio/")
+        Log.w(TAG, "Source failed ($newCount consecutive), retry in ${delay / 1000}s")
     }
 
     fun showNewMatchNotification(channel: Channel) {
@@ -134,12 +119,10 @@ class ChannelsProvider(application: Application) : AndroidViewModel(application)
     private var fetchJob: Job? = null
 
     companion object {
+
         private const val TAG = "ChannelsProvider"
         private const val DEFAULT_LOGO_URL = ""
-        private const val CONNECT_TIMEOUT = 30000
-        private const val READ_TIMEOUT = 30000
         private const val FETCH_COOLDOWN_MS = 5 * 60 * 1000L // 5 minutes
-        private const val MAX_RESPONSE_SIZE = 100 * 1024 * 1024L // 100 MB — large IPTV M3U playlists can be tens of MB of text
         // Per-source exponential backoff bounds (used to stop hammering failing URLs)
         private const val BASE_BACKOFF_MS = 60 * 1000L // 1 minute
         private const val MAX_BACKOFF_MS = 60 * 60 * 1000L // 1 hour cap
@@ -147,15 +130,6 @@ class ChannelsProvider(application: Application) : AndroidViewModel(application)
             ".mp4", ".mkv", ".avi", ".mov", ".wmv", ".flv", ".webm",
             ".mpg", ".mpeg", ".3gp", ".ogv", ".rm", ".rmvb"
         )
-        // Content types that ARE valid playlists and must never be rejected.
-        // Note: M3U/M3U8 files are commonly served as audio/x-mpegurl or application/x-mpegurl.
-        private val PLAYLIST_CONTENT_TYPES = setOf(
-            "audio/x-mpegurl", "audio/mpegurl",
-            "application/x-mpegurl", "application/mpegurl",
-            "application/vnd.apple.mpegurl", "application/vnd.apple.mpegurl.audio",
-            "application/octet-stream"
-        )
-
         // Generic JSON field-name candidates used to parse arbitrary IPTV JSON playlists.
         private val JSON_URL_KEYS = listOf(
             "url", "link", "stream", "stream_url", "streamurl", "streamUrl",
@@ -229,476 +203,145 @@ class ChannelsProvider(application: Application) : AndroidViewModel(application)
 
     fun fetchM3UFile(forceRefresh: Boolean = false) {
         refreshProviders()
-        fetchJob?.cancel()
-
-        // Explicit user actions (adding/editing/toggling/deleting a provider, manual refresh)
-        // clear any accumulated backoff so the affected sources get a fresh attempt.
-        if (forceRefresh) {
-            sourceFailureStates.clear()
-        }
-
-        val sourceUrlsSnapshot = synchronized(sourceUrls) {
-            if (sourceUrls.isEmpty()) {
-                _channels.postValue(emptyList())
-                _filteredChannels.postValue(emptyList())
-                _categories.postValue(emptyList())
-                _error.postValue("No source URLs configured")
-                _isLoading.postValue(false)
-                return
-            }
-            sourceUrls.toList()
-        }
-
-        lastFetchTimestamp = System.currentTimeMillis()
-        lastFetchedUrlsHash = sourceUrlsSnapshot.hashCode()
-
-        _isLoading.postValue(true)
-
-        fetchJob = viewModelScope.launch(Dispatchers.IO) {
-            val allChannels = mutableListOf<Channel>()
-            val errorMessages = StringBuilder()
-            var successCount = 0
-            val totalSources = sourceUrlsSnapshot.size
-            val channelCounts = mutableMapOf<String, Int>()
-
-            for ((index, sourceUrl) in sourceUrlsSnapshot.withIndex()) {
-                var connection: HttpURLConnection? = null
-                try {
-                    Log.d(TAG, "Fetching source ${index + 1}/$totalSources: $sourceUrl")
-
-                    // Skip sources currently in failure backoff to avoid repeated connection
-                    // attempts and wasted data. Preserve their last known channel count.
-                    val nowMs = System.currentTimeMillis()
-                    if (isInBackoff(sourceUrl, nowMs)) {
-                        val failures = sourceFailureStates[sourceUrl]?.failureCount ?: 0
-                        val waitSec = backoffRemainingSeconds(sourceUrl, nowMs)
-                        errorMessages.append("Source ${index + 1}: Temporarily skipped (failed ${failures}×, retry in ${waitSec}s).\n")
-                        channelCounts[sourceUrl] = repository.getProviders().find { it.url == sourceUrl }?.channelCount ?: 0
-                        Log.d(TAG, "Skipping source ${index + 1} due to backoff (${waitSec}s left): $sourceUrl")
-                        continue
-                    }
-
-                    // Handle direct video URLs by creating a single virtual channel
-                    if (isDirectVideoUrl(sourceUrl)) {
-                        val provider = repository.getProviders().find { it.url == sourceUrl }
-                        val name = provider?.title ?: sourceUrl.substringAfterLast("/").substringBeforeLast(".")
-                        val channels = listOf(
-                            Channel(
-                                name = name,
-                                logoUrl = DEFAULT_LOGO_URL,
-                                streamUrl = sourceUrl,
-                                category = "Direct Videos"
-                            )
-                        )
-                        allChannels.addAll(channels)
-                        channelCounts[sourceUrl] = channels.size
-                        successCount++
-                        recordSourceSuccess(sourceUrl)
-                        if (provider != null) {
-                            repository.updateProvider(provider.copy(channelCount = channels.size))
-                        }
-                        continue
-                    }
-
-                    // BUG-021 fix: validate URL scheme to prevent local file read (SSRF)
-                    val scheme = URL(sourceUrl).protocol
-                    if (scheme != "http" && scheme != "https") {
-                        errorMessages.append("Source ${index + 1}: Rejected — unsupported URL scheme '$scheme'. Only http/https allowed.\n")
-                        channelCounts[sourceUrl] = 0
-                        Log.w(TAG, "Rejected non-http URL scheme '$scheme' for source ${index + 1}: $sourceUrl")
-                        continue
-                    }
-
-                    val url = URL(sourceUrl)
-                    connection = url.openConnection() as HttpURLConnection
-                    connection.connectTimeout = CONNECT_TIMEOUT
-                    connection.readTimeout = READ_TIMEOUT
-                    connection.requestMethod = "GET"
-                    connection.setRequestProperty("User-Agent", "IPTVmine/1.0 (Android)")
-                    connection.setRequestProperty("Accept", "*/*")
-                    connection.instanceFollowRedirects = true
-
-                    if (connection.responseCode == HttpURLConnection.HTTP_OK) {
-                        // Validate Content-Type: reject genuine video/audio/image media (but allow
-                        // M3U playlists served as audio/x-mpegurl, application/x-mpegurl, etc.)
-                        val contentType = connection.contentType ?: ""
-                        if (isBlockedContentType(contentType)) {
-                            errorMessages.append("Source ${index + 1}: Rejected — server returned '$contentType' (not a playlist).\n")
-                            channelCounts[sourceUrl] = 0
-                            recordSourceFailure(sourceUrl)
-                            Log.w(TAG, "Rejected content type '$contentType' for source ${index + 1}")
-                            continue
-                        }
-
-                        // Validate Content-Length: reject responses larger than 10MB
-                        val contentLength = connection.contentLengthLong
-                        if (contentLength > MAX_RESPONSE_SIZE) {
-                            errorMessages.append("Source ${index + 1}: Rejected — response too large (${contentLength / 1024 / 1024}MB). Max allowed: ${MAX_RESPONSE_SIZE / 1024 / 1024}MB.\n")
-                            channelCounts[sourceUrl] = 0
-                            recordSourceFailure(sourceUrl)
-                            Log.w(TAG, "Rejected oversized response (${contentLength} bytes) for source ${index + 1}")
-                            continue
-                        }
-
-                        val content = BufferedReader(InputStreamReader(connection.inputStream)).use { reader ->
-                            val stringBuilder = StringBuilder()
-                            var line: String?
-                            var totalRead = 0L
-                            while (reader.readLine().also { line = it } != null) {
-                                // BUG-015 fix: use actual byte length (not char count) for accurate UTF-8 cap
-                                totalRead += (line?.toByteArray(Charsets.UTF_8)?.size ?: 0) + 1
-                                if (totalRead > MAX_RESPONSE_SIZE) {
-                                    Log.w(TAG, "Aborting read — response exceeded $MAX_RESPONSE_SIZE bytes for source ${index + 1}")
-                                    break
-                                }
-                                stringBuilder.append(line).append("\n")
-                            }
-                            stringBuilder.toString()
-                        }
-
-                        val provider = repository.getProviders().find { it.url == sourceUrl }
-                        val channels = parsePlaylistContent(content, sourceUrl, provider?.title ?: "")
-                        allChannels.addAll(channels)
-                        channelCounts[sourceUrl] = channels.size
-                        successCount++
-                        recordSourceSuccess(sourceUrl)
-                        
-                        // Update persisted count in SharedPreferences
-                        if (provider != null) {
-                            repository.updateProvider(provider.copy(channelCount = channels.size))
-                        }
-                        
-                        Log.d(TAG, "Loaded ${channels.size} channels from source ${index + 1}")
-                    } else {
-                        // BUG-007 fix: drain the error stream to release the TCP socket back to the pool
-                        try { connection.errorStream?.close() } catch (_: Exception) {}
-                        errorMessages.append("Source ${index + 1}: HTTP ${connection.responseCode}\n")
-                        channelCounts[sourceUrl] = 0
-                        recordSourceFailure(sourceUrl)
-                    }
-                } catch (e: java.net.UnknownHostException) {
-                    errorMessages.append("Source ${index + 1}: No internet connection or DNS error\n")
-                    channelCounts[sourceUrl] = 0
-                    recordSourceFailure(sourceUrl)
-                    Log.e(TAG, "Network error for source ${index + 1}", e)
-                } catch (e: java.net.SocketTimeoutException) {
-                    errorMessages.append("Source ${index + 1}: Connection timeout\n")
-                    channelCounts[sourceUrl] = 0
-                    recordSourceFailure(sourceUrl)
-                    Log.e(TAG, "Timeout for source ${index + 1}", e)
-                } catch (e: java.io.IOException) {
-                    errorMessages.append("Source ${index + 1}: Network I/O error - ${e.message}\n")
-                    channelCounts[sourceUrl] = 0
-                    recordSourceFailure(sourceUrl)
-                    Log.e(TAG, "I/O error for source ${index + 1}", e)
-                } catch (e: Exception) {
-                    errorMessages.append("Source ${index + 1}: ${e.localizedMessage ?: e.message ?: "Unknown error"}\n")
-                    channelCounts[sourceUrl] = 0
-                    recordSourceFailure(sourceUrl)
-                    Log.e(TAG, "Error fetching source ${index + 1}", e)
-                } finally {
-                    connection?.disconnect()
-                }
-            }
-
-            withContext(Dispatchers.Main) {
-                refreshProviders()
-                _providerChannelCounts.value = channelCounts
-                if (allChannels.isNotEmpty()) {
-                    _channels.value = allChannels
-                    _filteredChannels.value = allChannels
-                    updateCategories(allChannels)
-                    
-                    _error.value = if (successCount < totalSources && errorMessages.isNotEmpty()) {
-                        "Loaded $successCount/$totalSources sources. Errors:\n$errorMessages"
-                    } else null
-                    
-                    Log.d(TAG, "Total channels: ${allChannels.size}")
-                } else {
-                    _error.value = if (errorMessages.isNotEmpty()) {
-                        "Failed to fetch channels from all sources:\n$errorMessages"
-                    } else {
-                        "Failed to fetch channels: No data available"
-                    }
-                }
-                _isLoading.value = false
-            }
-        }
+        if (forceRefresh) sourceFailureStates.clear()
+        startFetch(getSourceUrls(), respectBackoff = !forceRefresh)
     }
 
     fun fetchFromSingleSource(sourceUrl: String) {
-        fetchJob?.cancel()
-        _isLoading.postValue(true)
-        // Explicit single-source action: clear this URL's backoff so it gets a fresh attempt.
         sourceFailureStates.remove(sourceUrl)
+        startFetch(listOf(sourceUrl), respectBackoff = false)
+    }
 
+    private fun startFetch(urls: List<String>, respectBackoff: Boolean) {
+        val previous = fetchJob
+        previous?.cancel()
+        filterJob?.cancel()
+        lastFetchTimestamp = System.currentTimeMillis()
+        lastFetchedUrlsHash = urls.hashCode()
+        _isLoading.value = true
         fetchJob = viewModelScope.launch(Dispatchers.IO) {
-            var connection: HttpURLConnection? = null
+            // SQLite imports are serialized; cancellation finishes rollback before the next import.
+            previous?.join()
+            val ownJob = currentCoroutineContext()[Job]
+            val failures = StringBuilder()
+            var successes = 0
             try {
-                if (isDirectVideoUrl(sourceUrl)) {
-                    val provider = repository.getProviders().find { it.url == sourceUrl }
-                    val name = provider?.title ?: sourceUrl.substringAfterLast("/").substringBeforeLast(".")
-                    val channels = listOf(
-                        Channel(
-                            name = name,
-                            logoUrl = DEFAULT_LOGO_URL,
-                            streamUrl = sourceUrl,
-                            category = "Direct Videos"
-                        )
-                    )
-                    recordSourceSuccess(sourceUrl)
-                    if (provider != null) {
-                        repository.updateProvider(provider.copy(channelCount = channels.size))
+                // Cached generations remain available during download and after a failed update.
+                publishSnapshot(urls)
+                for ((index, source) in urls.withIndex()) {
+                    ensureActive()
+                    if (respectBackoff && isInBackoff(source, System.currentTimeMillis())) {
+                        failures.append("Source ${index + 1}: Temporarily skipped (retry in ${backoffRemainingSeconds(source, System.currentTimeMillis())}s).\n")
+                        continue
                     }
-                    withContext(Dispatchers.Main) {
-                        refreshProviders()
-                        val currentMap = _providerChannelCounts.value.orEmpty().toMutableMap()
-                        currentMap[sourceUrl] = channels.size
-                        _providerChannelCounts.value = currentMap
-                        _channels.value = channels
-                        _filteredChannels.value = channels
-                        updateCategories(channels)
-                        _error.value = null
-                        _isLoading.value = false
-                    }
-                    return@launch
-                }
-
-                val url = URL(sourceUrl)
-                connection = url.openConnection() as HttpURLConnection
-                connection.connectTimeout = CONNECT_TIMEOUT
-                connection.readTimeout = READ_TIMEOUT
-                connection.requestMethod = "GET"
-                connection.setRequestProperty("User-Agent", "IPTVmine/1.0 (Android)")
-                connection.setRequestProperty("Accept", "*/*")
-                connection.instanceFollowRedirects = true
-
-                if (connection.responseCode == HttpURLConnection.HTTP_OK) {
-                    // Validate Content-Type: reject genuine video/audio/image media (but allow
-                    // M3U playlists served as audio/x-mpegurl, application/x-mpegurl, etc.)
-                    val contentType = connection.contentType ?: ""
-                    if (isBlockedContentType(contentType)) {
-                        withContext(Dispatchers.Main) {
-                            _error.value = "Error: Server returned '$contentType' — this is not a playlist file."
-                            _isLoading.value = false
+                    try {
+                        importSource(source)
+                        recordSourceSuccess(source)
+                        successes++
+                    } catch (cancelled: CancellationException) {
+                        throw cancelled
+                    } catch (failure: Exception) {
+                        ensureActive()
+                        recordSourceFailure(source)
+                        // Exception messages from HTTP clients may contain credential-bearing URLs.
+                        val reason = when (failure) {
+                            is PlaylistHttpException -> "HTTP ${failure.statusCode}"
+                            is PlaylistLimitException -> failure.message ?: "Playlist safety limit exceeded"
+                            is java.net.UnknownHostException -> "No internet connection or DNS error"
+                            is java.net.SocketTimeoutException -> "Connection timeout"
+                            is IOException -> "Incomplete or invalid playlist / network I/O error"
+                            else -> "Playlist import failed"
                         }
-                        return@launch
-                    }
-
-                    // Validate Content-Length: reject responses larger than 10MB
-                    val contentLength = connection.contentLengthLong
-                    if (contentLength > MAX_RESPONSE_SIZE) {
-                        withContext(Dispatchers.Main) {
-                            _error.value = "Error: Response too large (${contentLength / 1024 / 1024}MB). This doesn't appear to be a playlist."
-                            _isLoading.value = false
-                        }
-                        return@launch
-                    }
-
-                    val content = BufferedReader(InputStreamReader(connection.inputStream)).use { reader ->
-                        val stringBuilder = StringBuilder()
-                        var line: String?
-                        var totalRead = 0L
-                        while (reader.readLine().also { line = it } != null) {
-                            totalRead += (line?.length ?: 0) + 1
-                            if (totalRead > MAX_RESPONSE_SIZE) {
-                                Log.w(TAG, "Aborting read — response exceeded $MAX_RESPONSE_SIZE bytes")
-                                break
-                            }
-                            stringBuilder.append(line).append("\n")
-                        }
-                        stringBuilder.toString()
-                    }
-
-                    val provider = repository.getProviders().find { it.url == sourceUrl }
-                    val channels = parsePlaylistContent(content, sourceUrl, provider?.title ?: "")
-                    recordSourceSuccess(sourceUrl)
-
-                    // Update persisted count in SharedPreferences
-                    if (provider != null) {
-                        repository.updateProvider(provider.copy(channelCount = channels.size))
-                    }
-
-                    withContext(Dispatchers.Main) {
-                        refreshProviders()
-
-                        val currentMap = _providerChannelCounts.value.orEmpty().toMutableMap()
-                        currentMap[sourceUrl] = channels.size
-                        _providerChannelCounts.value = currentMap
-
-                        _channels.value = channels
-                        _filteredChannels.value = channels
-                        updateCategories(channels)
-                        _error.value = null
-                    }
-                } else {
-                    recordSourceFailure(sourceUrl)
-                    withContext(Dispatchers.Main) {
-                        val currentMap = _providerChannelCounts.value.orEmpty().toMutableMap()
-                        currentMap[sourceUrl] = 0
-                        _providerChannelCounts.value = currentMap
-
-                        _error.value = "Error: HTTP ${connection.responseCode}"
+                        failures.append("Source ${index + 1}: $reason\n")
+                        Log.w(TAG, "Source ${index + 1} import failed (${failure.javaClass.simpleName}); previous playlist retained")
                     }
                 }
-            } catch (e: java.net.UnknownHostException) {
-                recordSourceFailure(sourceUrl)
+                publishSnapshot(urls)
                 withContext(Dispatchers.Main) {
-                    val currentMap = _providerChannelCounts.value.orEmpty().toMutableMap()
-                    currentMap[sourceUrl] = 0
-                    _providerChannelCounts.value = currentMap
-                    _error.value = "Network Error: No internet connection or unable to resolve host. Please check your connection."
+                    _error.value = when {
+                        urls.isEmpty() -> "No source URLs configured"
+                        failures.isNotEmpty() -> "Loaded $successes/${urls.size} sources. Previous data retained for failed sources.\n$failures"
+                        else -> null
+                    }
                 }
-            } catch (e: java.net.SocketTimeoutException) {
-                recordSourceFailure(sourceUrl)
-                withContext(Dispatchers.Main) {
-                    val currentMap = _providerChannelCounts.value.orEmpty().toMutableMap()
-                    currentMap[sourceUrl] = 0
-                    _providerChannelCounts.value = currentMap
-                    _error.value = "Network Error: Connection timeout. Please check your internet speed."
-                }
-            } catch (e: java.io.IOException) {
-                recordSourceFailure(sourceUrl)
-                withContext(Dispatchers.Main) {
-                    val currentMap = _providerChannelCounts.value.orEmpty().toMutableMap()
-                    currentMap[sourceUrl] = 0
-                    _providerChannelCounts.value = currentMap
-                    _error.value = "Network Error: ${e.message ?: "Unable to connect to server"}"
-                }
-            } catch (e: Exception) {
-                recordSourceFailure(sourceUrl)
-                withContext(Dispatchers.Main) {
-                    val currentMap = _providerChannelCounts.value.orEmpty().toMutableMap()
-                    currentMap[sourceUrl] = 0
-                    _providerChannelCounts.value = currentMap
-                    _error.value = "Error: ${e.localizedMessage ?: e.message ?: "Unknown error occurred"}"
-                }
+            } catch (cancelled: CancellationException) {
+                throw cancelled
+            } catch (failure: Exception) {
+                Log.w(TAG, "Unable to load playlist storage (${failure.javaClass.simpleName})")
+                withContext(Dispatchers.Main) { _error.value = "Unable to read or update playlist storage. Previous data retained." }
             } finally {
-                connection?.disconnect()
-                withContext(Dispatchers.Main) {
-                    _isLoading.value = false
+                withContext(NonCancellable + Dispatchers.Main) {
+                    if (fetchJob === ownJob) _isLoading.value = false
                 }
             }
         }
+
     }
 
-    private fun parseM3UFile(fileText: String): List<Channel> {
-        Log.d(TAG, "Starting to parse M3U file, content length: ${fileText.length}")
-        
-        val lines = fileText.split("\n")
-        val channelsList = ArrayList<Channel>(lines.size / 2)
-        
-        var name: String? = null
-        var logoUrl = DEFAULT_LOGO_URL
-        var streamUrl: String? = null
-        var category: String? = null
-        
-        var validUrlCount = 0
-        var invalidUrlCount = 0
-
-        for (line in lines) {
-            when {
-                line.startsWith("#EXTINF:") -> {
-                    name = extractChannelName(line)
-                    logoUrl = extractLogoUrl(line) ?: DEFAULT_LOGO_URL
-                    category = extractCategory(line)
-                }
-                line.trim().isNotEmpty() -> {
-                    if (isValidStreamUrl(line)) {
-                        streamUrl = line
-                        validUrlCount++
-                        
-                        // Filter out adult content using ContentFilter
-                        if (!name.isNullOrEmpty() && !streamUrl.isNullOrEmpty()) {
-                            if (!ContentFilter.shouldBlockContent(name, category)) {
-                                channelsList.add(
-                                    Channel(
-                                        name = name,
-                                        logoUrl = logoUrl,
-                                        streamUrl = streamUrl,
-                                        category = category ?: "Uncategorized"
-                                    )
-                                )
-                                Log.d(TAG, "Added channel: $name with URL: ${streamUrl.take(50)}")
-                            } else {
-                                Log.d(TAG, "Blocked content: $name (Category: $category)")
+    private suspend fun importSource(source: String) {
+        val url = URL(source)
+        if (url.protocol != "http" && url.protocol != "https") throw IOException("Unsupported playlist scheme")
+        val provider = repository.getProviders().find { it.url == source }
+        if (isDirectVideoUrl(source)) {
+            playlistStore.beginImport(source).use { staging ->
+                staging.add(Channel(provider?.title ?: source.substringAfterLast('/').substringBeforeLast('.'), "", source, category = "Direct Videos"))
+                currentCoroutineContext().ensureActive()
+                staging.publish()
+            }
+        } else {
+            PlaylistDownload.useFile(getApplication<Application>().cacheDir, source) { file, checkCancelled ->
+                playlistStore.beginImport(source).use { staging ->
+                    val prefix = file.inputStream().use { input ->
+                        val bytes = ByteArray(8192)
+                        val count = input.read(bytes)
+                        if (count <= 0) "" else String(bytes, 0, count, Charsets.UTF_8).trim().removePrefix("\uFEFF")
+                    }
+                    fun importJson() {
+                        val content = PlaylistDownload.readSmallJson(file, checkCancelled)
+                        val start = content.indexOfFirst { it == '{' || it == '[' }
+                        if (start < 0) throw IOException("Invalid JSON playlist")
+                        parseJSONFile(content.substring(start)).forEach { checkCancelled(); staging.add(it) }
+                    }
+                    val jsonPrefix = !prefix.startsWith("#") && (prefix.contains('{') || prefix.contains('['))
+                    if (jsonPrefix) {
+                        importJson()
+                    } else {
+                        val summary = M3uParser.parse(file.inputStream(), validUrl = ::isValidStreamUrl,
+                            checkCancelled = checkCancelled) { record ->
+                            if (!ContentFilter.shouldBlockContent(record.name, record.category)) {
+                                staging.add(Channel(record.name, record.logoUrl, record.streamUrl, category = record.category,
+                                    tvgId = record.tvgId, tvgName = record.tvgName, playlistMetadata = record.metadata))
                             }
                         }
-                        
-                        name = null
-                        logoUrl = DEFAULT_LOGO_URL
-                        category = null
-                    } else if (line.startsWith("http")) {
-                        invalidUrlCount++
-                        Log.d(TAG, "Invalid stream URL rejected: ${line.take(50)}")
+                        if (summary.hasJson && !summary.isM3u && !summary.isHls) {
+                            staging.clear()
+                            importJson()
+                        } else if (summary.isHls) {
+                            staging.clear()
+                            val title = provider?.title.orEmpty().ifBlank { source.substringAfterLast('/').substringBeforeLast('.').ifBlank { "Stream" } }
+                            staging.add(Channel(title, "", source, category = "Direct Videos"))
+                        }
                     }
+                    staging.publish(checkCancelled)
                 }
             }
         }
-
-        Log.d(TAG, "Parsing complete. Valid URLs: $validUrlCount, Invalid URLs: $invalidUrlCount, Total channels: ${channelsList.size}")
-        return channelsList
+        val count = playlistStore.count(source)
+        provider?.let { repository.updateProvider(it.copy(channelCount = count)) }
     }
 
-    private fun parsePlaylistContent(content: String, sourceUrl: String = "", fallbackName: String = ""): List<Channel> {
-        val trimmed = content.trim()
-        
-        // Check if it's M3U format
-        val isM3U = trimmed.contains("#EXTM3U") || trimmed.contains("#EXTINF")
-
-        // Detect a direct HLS stream (an actual playable video), NOT an IPTV channel list.
-        // HLS master playlists (#EXT-X-STREAM-INF) and media playlists (#EXT-X-TARGETDURATION,
-        // #EXT-X-MEDIA-SEQUENCE, #EXT-X-PLAYLIST-TYPE) should play as a single video — exactly
-        // like a direct .mp4 URL — by pointing the player straight at the source .m3u8 URL.
-        val isHlsStream = trimmed.contains("#EXT-X-STREAM-INF") ||
-                          trimmed.contains("#EXT-X-TARGETDURATION") ||
-                          trimmed.contains("#EXT-X-MEDIA-SEQUENCE") ||
-                          trimmed.contains("#EXT-X-PLAYLIST-TYPE")
-
-        // Check if it's an HLS master playlist (contains stream variant info but no EXTINF channel list)
-        val isHlsMaster = trimmed.contains("#EXT-X-STREAM-INF") && !trimmed.contains("#EXTINF")
-
-        // Anything that isn't M3U/HLS but looks like JSON (starts with { or [) is parsed generically.
-        val looksLikeJson = !isM3U && (trimmed.startsWith("{") || trimmed.startsWith("["))
-        val hasEmbeddedJson = !isM3U && (trimmed.contains("{") || trimmed.contains("["))
-
-        return when {
-            isHlsStream && sourceUrl.isNotBlank() -> {
-                // Treat the whole .m3u8 as one direct video — the player handles HLS natively.
-                val name = fallbackName.ifBlank {
-                    sourceUrl.substringAfterLast("/").substringBeforeLast(".").ifBlank { "Stream" }
-                }
-                listOf(
-                    Channel(
-                        name = name,
-                        logoUrl = DEFAULT_LOGO_URL,
-                        streamUrl = sourceUrl,
-                        category = "Direct Videos"
-                    )
-                )
-            }
-            isHlsMaster -> {
-                // HLS master playlist without a known source URL: parse stream variants
-                parseHlsMasterPlaylist(content)
-            }
-            looksLikeJson || hasEmbeddedJson -> {
-                // Extract the clean JSON part (from first brace/bracket onward)
-                val firstBrace = trimmed.indexOf('{')
-                val firstBracket = trimmed.indexOf('[')
-                val jsonStart = when {
-                    firstBrace != -1 && firstBracket != -1 -> minOf(firstBrace, firstBracket)
-                    firstBrace != -1 -> firstBrace
-                    else -> firstBracket
-                }
-                if (jsonStart != -1) {
-                    val channels = parseJSONFile(trimmed.substring(jsonStart).trim())
-                    // Fall back to M3U parsing if JSON produced nothing (e.g. malformed / not really JSON)
-                    if (channels.isNotEmpty()) channels else parseM3UFile(content)
-                } else {
-                    parseM3UFile(content)
-                }
-            }
-            else -> parseM3UFile(content)
+    private suspend fun publishSnapshot(urls: List<String>) {
+        val snapshot = playlistStore.snapshot(urls)
+        val counts = snapshot.categoryCounts()
+        val categories = counts.project { it.first }.withAll("All")
+        val sourceCounts = urls.associateWith { playlistStore.count(it) }
+        withContext(Dispatchers.Main) {
+            _channels.value = snapshot
+            _filteredChannels.value = snapshot
+            _categories.value = if (snapshot.isEmpty()) emptyList() else categories
+            _categoryCounts.value = counts
+            _providerChannelCounts.value = sourceCounts
+            refreshProviders()
         }
     }
 
@@ -736,7 +379,8 @@ class ChannelsProvider(application: Application) : AndroidViewModel(application)
                 Log.d(TAG, "Generic JSON parse produced ${channelsList.size} channels")
             }
         } catch (e: Exception) {
-            Log.e(TAG, "Error parsing JSON content", e)
+            Log.w(TAG, "Invalid JSON playlist (${e.javaClass.simpleName})")
+            throw IOException("Invalid JSON playlist")
         }
         return channelsList
     }
@@ -863,54 +507,10 @@ class ChannelsProvider(application: Application) : AndroidViewModel(application)
                             startTime = startTime
                         )
                     )
-                    Log.d(TAG, "Added event channel: $name with URL: ${streamUrl.take(50)}")
-                } else {
-                    Log.d(TAG, "Blocked event content: $name (Category: $category)")
+
                 }
             }
         }
-    }
-
-    private fun extractChannelName(line: String): String? {
-        val commaIndex = line.lastIndexOf(",")
-        return if (commaIndex != -1 && commaIndex < line.length - 1) {
-            line.substring(commaIndex + 1).trim()
-        } else null
-    }
-
-    private fun extractLogoUrl(line: String): String? {
-        val parts = line.split("\"")
-        return parts.firstOrNull { isValidUrl(it) }
-    }
-
-    private fun extractCategory(line: String): String? {
-        val lowerLine = line.lowercase()
-        
-        var index = lowerLine.indexOf("group-title=")
-        if (index != -1) {
-            val startQuote = line.indexOf('"', index)
-            if (startQuote != -1) {
-                val endQuote = line.indexOf('"', startQuote + 1)
-                if (endQuote != -1) {
-                    val cat = line.substring(startQuote + 1, endQuote).trim()
-                    return if (cat.isEmpty()) "Uncategorized" else cat
-                }
-            }
-        }
-
-        index = lowerLine.indexOf("tvg-group=")
-        if (index != -1) {
-            val startQuote = line.indexOf('"', index)
-            if (startQuote != -1) {
-                val endQuote = line.indexOf('"', startQuote + 1)
-                if (endQuote != -1) {
-                    val cat = line.substring(startQuote + 1, endQuote).trim()
-                    return if (cat.isEmpty()) "Uncategorized" else cat
-                }
-            }
-        }
-
-        return "Uncategorized"
     }
 
     private fun isValidUrl(url: String?): Boolean {
@@ -928,127 +528,40 @@ class ChannelsProvider(application: Application) : AndroidViewModel(application)
 
     /**
      * Check if a URL points directly to a video file (not a playlist).
-     * These should be rejected as provider URLs since downloading them
-     * into memory causes OOM crashes and high data consumption.
+     * Direct video providers become a virtual channel without downloading the video.
      */
     private fun isDirectVideoUrl(url: String): Boolean {
         val lowerUrl = url.lowercase().split("?").first().split("#").first()
         return VIDEO_EXTENSIONS.any { lowerUrl.endsWith(it) }
     }
 
-    /**
-     * Parse an HLS master playlist that contains #EXT-X-STREAM-INF entries.
-     * Extracts stream variant URLs as individual channels.
-     */
-    private fun parseHlsMasterPlaylist(content: String): List<Channel> {
-        val channels = mutableListOf<Channel>()
-        val lines = content.split("\n")
-        var streamInfo: String? = null
+    fun filterChannels(query: String) = filterChannelsByQueryAndCategory(query, null)
 
-        for (line in lines) {
-            val trimmed = line.trim()
-            when {
-                trimmed.startsWith("#EXT-X-STREAM-INF:") -> {
-                    streamInfo = trimmed
-                }
-                streamInfo != null && trimmed.isNotEmpty() && !trimmed.startsWith("#") -> {
-                    // Extract bandwidth and resolution from stream info
-                    val bandwidth = Regex("BANDWIDTH=(\\d+)").find(streamInfo)?.groupValues?.get(1)?.toLongOrNull()
-                    val resolution = Regex("RESOLUTION=(\\S+)").find(streamInfo)?.groupValues?.get(1) ?: "Unknown"
-                    val bandwidthLabel = if (bandwidth != null) "${bandwidth / 1000}kbps" else "Unknown"
-                    val name = "Stream $resolution ($bandwidthLabel)"
-
-                    val streamUrl = if (isValidUrl(trimmed)) trimmed else ""
-                    if (streamUrl.isNotEmpty()) {
-                        channels.add(
-                            Channel(
-                                name = name,
-                                logoUrl = DEFAULT_LOGO_URL,
-                                streamUrl = streamUrl,
-                                category = "HLS Streams"
-                            )
-                        )
-                    }
-                    streamInfo = null
-                }
-            }
-        }
-
-        Log.d(TAG, "Parsed HLS master playlist: ${channels.size} stream variants")
-        return channels
-    }
-
-    fun filterChannels(query: String) {
-        val allChannels = _channels.value ?: emptyList()
-        val lowerCaseQuery = query.lowercase()
-        val filtered = ArrayList<Channel>(minOf(50, allChannels.size))
-        
-        for (channel in allChannels) {
-            if (channel.name.lowercase().contains(lowerCaseQuery)) {
-                filtered.add(channel)
-            }
-        }
-        _filteredChannels.postValue(filtered)
-    }
-
-    fun filterChannelsByCategory(category: String?) {
-        val allChannels = _channels.value ?: emptyList()
-        
-        _filteredChannels.postValue(
-            if (category.isNullOrEmpty() || category == "All") {
-                ArrayList(allChannels)
-            } else {
-                val filtered = ArrayList<Channel>()
-                for (channel in allChannels) {
-                    if (category == channel.category) {
-                        filtered.add(channel)
-                    }
-                }
-                filtered
-            }
-        )
-    }
+    fun filterChannelsByCategory(category: String?) = filterChannelsByQueryAndCategory(null, category)
 
     fun filterChannelsByQueryAndCategory(query: String?, category: String?) {
-        val allChannels = _channels.value ?: emptyList()
-        val lowerCaseQuery = query?.lowercase() ?: ""
-        val filtered = ArrayList<Channel>()
-
-        for (channel in allChannels) {
-            val categoryMatch = category.isNullOrEmpty() || category.equals("all", ignoreCase = true) || category == channel.category
-            val queryMatch = lowerCaseQuery.isEmpty() || channel.name.lowercase().contains(lowerCaseQuery)
-
-            if (categoryMatch && queryMatch) {
-                filtered.add(channel)
-            }
+        filterJob?.cancel()
+        val snapshot = _channels.value as? ChannelList<Channel> ?: return
+        filterJob = viewModelScope.launch(Dispatchers.IO) {
+            val result = snapshot.filtered(query, category)
+            withContext(Dispatchers.Main) { _filteredChannels.value = result }
         }
-        _filteredChannels.postValue(filtered)
-    }
-
-    private fun updateCategories(channelList: List<Channel>) {
-        if (channelList.isEmpty()) {
-            _categories.postValue(emptyList())
-            return
-        }
-
-        val uniqueCategories = HashSet<String>()
-        for (channel in channelList) {
-            val cat = channel.category
-            // Filter out adult categories using ContentFilter
-            if (!cat.isNullOrEmpty() && !ContentFilter.isBlockedCategory(cat)) {
-                uniqueCategories.add(cat)
-            }
-        }
-
-        val categoryList = ArrayList(uniqueCategories).apply {
-            sort()
-            add(0, "All")
-        }
-        _categories.postValue(categoryList)
     }
 
     override fun onCleared() {
-        super.onCleared()
         fetchJob?.cancel()
+        filterJob?.cancel()
+        val fetching = fetchJob
+        val filtering = filterJob
+        CoroutineScope(Dispatchers.IO).launch {
+            fetching?.join()
+            filtering?.join()
+            try {
+                if (playlistStoreDelegate.isInitialized()) playlistStore.close()
+            } catch (failure: Exception) {
+                Log.w(TAG, "Playlist storage cleanup failed (${failure.javaClass.simpleName})")
+            }
+        }
+        super.onCleared()
     }
 }

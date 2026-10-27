@@ -86,7 +86,15 @@ fun HomeScreen(
                     modifier = Modifier.align(Alignment.TopCenter)
                 )
             } else {
-                val chunkedChannels = remember(channels) { channels.chunked(2) }
+                val chunkedChannels = remember(channels) {
+                    object : AbstractList<List<Channel>>() {
+                        override val size get() = (channels.size + 1) / 2
+                        override fun get(index: Int): List<Channel> {
+                            val start = index * 2
+                            return channels.subList(start, minOf(start + 2, channels.size))
+                        }
+                    }
+                }
 
                 LazyColumn(
                     contentPadding = PaddingValues(16.dp),

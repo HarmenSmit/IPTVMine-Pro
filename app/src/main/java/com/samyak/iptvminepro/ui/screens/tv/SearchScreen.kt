@@ -13,6 +13,7 @@ import androidx.compose.material.icons.filled.Clear
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.runtime.livedata.observeAsState
+import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
@@ -38,9 +39,9 @@ fun SearchScreen(
     val isLoading by viewModel.isLoading.observeAsState(false)
     val errorMessage by viewModel.error.observeAsState(null)
 
-    var searchQuery by remember { mutableStateOf("") }
+    var searchQuery by rememberSaveable { mutableStateOf("") }
     val categoryAll = stringResource(id = R.string.category_all)
-    var selectedCategory by remember { mutableStateOf(categoryAll) }
+    var selectedCategory by rememberSaveable { mutableStateOf(categoryAll) }
 
     LaunchedEffect(categoryAll) {
         if (selectedCategory != categoryAll && !categories.contains(selectedCategory)) {

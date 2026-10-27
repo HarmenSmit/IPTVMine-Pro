@@ -8,14 +8,20 @@ data class Channel(
     val logoUrl: String,
     val streamUrl: String,
     val streamType: String = "HTTP",
-    val category: String = "Uncategorized"
+    val category: String = "Uncategorized",
+    val tvgId: String = "",
+    val tvgName: String = "",
+    val playlistMetadata: String = ""
 ) : Parcelable {
     constructor(parcel: Parcel) : this(
         parcel.readString() ?: "",
         parcel.readString() ?: "",
         parcel.readString() ?: "",
         parcel.readString() ?: "HTTP",
-        parcel.readString() ?: "Uncategorized"
+        parcel.readString() ?: "Uncategorized",
+        parcel.readString() ?: "",
+        parcel.readString() ?: "",
+        parcel.readString() ?: ""
     )
 
     override fun writeToParcel(parcel: Parcel, flags: Int) {
@@ -24,6 +30,9 @@ data class Channel(
         parcel.writeString(streamUrl)
         parcel.writeString(streamType)
         parcel.writeString(category)
+        parcel.writeString(tvgId)
+        parcel.writeString(tvgName)
+        parcel.writeString(playlistMetadata)
     }
 
     override fun describeContents(): Int = 0

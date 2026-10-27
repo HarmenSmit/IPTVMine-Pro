@@ -49,3 +49,7 @@ dependencies {
     androidTestImplementation(libs.androidx.espresso.core)
     androidTestImplementation(libs.androidx.junit)
 }
+// Exercise streaming imports under a heap smaller than the playlist itself.
+tasks.withType<Test>().configureEach {
+    maxHeapSize = "64m"
+}

@@ -76,6 +76,7 @@ import com.samyak.iptvminepro.ui.screens.home.HomeScreen
 import com.samyak.iptvminepro.ui.screens.common.PlayerScreen
 import com.samyak.iptvminepro.ui.screens.tv.CategoryScreen
 import com.samyak.iptvminepro.ui.screens.tv.CategoryDetailScreen
+import com.samyak.iptvminepro.ui.screens.tv.SearchScreen
 import com.samyak.iptvminepro.ui.screens.settings.AboutScreen
 import com.samyak.iptvminepro.ui.screens.settings.BugReportScreen
 import com.samyak.iptvminepro.ui.screens.settings.ExtensionsScreen
@@ -169,6 +170,7 @@ sealed class Screen(val route: String, val label: String, val icon: @Composable 
     object MovieDetail : Screen("movie_detail?link={link}&providerUrl={providerUrl}&scraperValue={scraperValue}", "Movie Detail", { })
     object CategoryMovies : Screen("category_movies?categoryName={categoryName}&categoryFilter={categoryFilter}&providerUrl={providerUrl}&scraperValue={scraperValue}", "Category Movies", { })
     object MovieSearch : Screen("movie_search", "Movie Search", { })
+    object ChannelSearch : Screen("channel_search", "Channel Search", { })
     object Downloads : Screen("downloads", "Downloads", { })
     object BugReport : Screen("bug_report", "Report Bug", { })
     object WatchHistory : Screen("watch_history", "Watch History", { })
@@ -312,6 +314,7 @@ fun MainApp() {
                 currentRoute != Screen.CategoryMovies.route &&
                 currentRoute != Screen.Extensions.route &&
                 currentRoute != Screen.MovieSearch.route &&
+                currentRoute != Screen.ChannelSearch.route &&
                 currentRoute != Screen.Downloads.route &&
                 currentRoute != Screen.BugReport.route &&
                 currentRoute != Screen.WatchHistory.route &&
@@ -407,6 +410,7 @@ fun MainApp() {
                 currentRoute != Screen.CategoryMovies.route &&
                 currentRoute != Screen.Extensions.route &&
                 currentRoute != Screen.MovieSearch.route &&
+                currentRoute != Screen.ChannelSearch.route &&
                 currentRoute != Screen.VideoList.route
             ) {
                 TopAppBar(
@@ -570,6 +574,10 @@ fun MainApp() {
                                     Icon(painterResource(id = R.drawable.ic_search), contentDescription = "Search TV Channels", tint = Color.White)
                                 }
                             }
+                        } else if (currentRoute == Screen.Home.route) {
+                            IconButton(onClick = { navController.navigate(Screen.ChannelSearch.route) }) {
+                                Icon(painterResource(id = R.drawable.ic_search), contentDescription = stringResource(R.string.placeholder_search_channels), tint = Color.White)
+                            }
                         } else if (currentRoute != Screen.ProviderList.route &&
                             currentRoute != Screen.AddProvider.route &&
                             currentRoute != Screen.AddProviderHelp.route &&
@@ -607,6 +615,7 @@ fun MainApp() {
             currentRoute == Screen.CategoryMovies.route ||
             currentRoute == Screen.Extensions.route ||
             currentRoute == Screen.MovieSearch.route ||
+            currentRoute == Screen.ChannelSearch.route ||
             currentRoute == Screen.VideoList.route
 
         NavHost(
@@ -793,6 +802,19 @@ fun MainApp() {
             ) { backStackEntry ->
                 val docType = backStackEntry.arguments?.getString("docType") ?: "privacy"
                 LegalDocumentScreen(docType = docType)
+            }
+            composable(Screen.ChannelSearch.route) {
+                SearchScreen(
+                    viewModel = channelsViewModel,
+                    onChannelClick = { channel ->
+                        if (channel.streamUrl.isEmpty()) {
+                            android.widget.Toast.makeText(context, "This match is not live yet!", android.widget.Toast.LENGTH_SHORT).show()
+                        } else {
+                            com.samyak.player.PlayerActivity.start(context, channel.name, channel.streamUrl)
+                        }
+                    },
+                    onBack = { navController.popBackStack() }
+                )
             }
             composable(Screen.MovieSearch.route) {
                 MovieSearchScreen(

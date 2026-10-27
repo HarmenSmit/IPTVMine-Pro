@@ -70,12 +70,7 @@ fun CategoryScreen(
         moviesViewModel.refreshProvidersAndInit()
     }
 
-    val tvCategoriesWithCount = remember(channels) {
-        channels.groupBy { it.category }
-            .mapValues { it.value.size }
-            .toList()
-            .sortedBy { it.first }
-    }
+    val tvCategoriesWithCount by channelsViewModel.categoryCounts.observeAsState(emptyList())
 
     // Movies states
     val vegaProviders = moviesViewModel.vegaProvidersList

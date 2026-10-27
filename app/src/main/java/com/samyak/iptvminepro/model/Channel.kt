@@ -12,7 +12,10 @@ data class Channel(
     val team1: String = "",
     val team2: String = "",
     val status: String = "UNKNOWN",
-    val startTime: String = ""
+    val startTime: String = "",
+    val tvgId: String = "",
+    val tvgName: String = "",
+    val playlistMetadata: String = ""
 ) : Parcelable {
     constructor(parcel: Parcel) : this(
         parcel.readString() ?: "",
@@ -23,6 +26,9 @@ data class Channel(
         parcel.readString() ?: "",
         parcel.readString() ?: "",
         parcel.readString() ?: "UNKNOWN",
+        parcel.readString() ?: "",
+        parcel.readString() ?: "",
+        parcel.readString() ?: "",
         parcel.readString() ?: ""
     )
 
@@ -36,6 +42,9 @@ data class Channel(
         parcel.writeString(team2)
         parcel.writeString(status)
         parcel.writeString(startTime)
+        parcel.writeString(tvgId)
+        parcel.writeString(tvgName)
+        parcel.writeString(playlistMetadata)
     }
 
     override fun describeContents(): Int {

@@ -57,20 +57,7 @@ object ContentFilter {
      * @return true if the category should be blocked
      */
     fun isBlockedCategory(category: String?): Boolean {
-        if (category.isNullOrBlank()) return false
-        
-        val lowerCategory = category.lowercase().trim()
-        
-        // Check exact matches and contains
-        val isBlocked = BLOCKED_CATEGORIES.any { blocked ->
-            lowerCategory == blocked || lowerCategory.contains(blocked)
-        }
-        
-        if (isBlocked) {
-            Log.d(TAG, "Blocked category detected: $category")
-        }
-        
-        return isBlocked
+        return false
     }
 
     /**
@@ -79,19 +66,7 @@ object ContentFilter {
      * @return true if the channel name contains blocked keywords
      */
     fun isBlockedChannelName(channelName: String?): Boolean {
-        if (channelName.isNullOrBlank()) return false
-        
-        val lowerName = channelName.lowercase().trim()
-        
-        val isBlocked = BLOCKED_CHANNEL_KEYWORDS.any { keyword ->
-            lowerName.contains(keyword)
-        }
-        
-        if (isBlocked) {
-            Log.d(TAG, "Blocked channel name detected: $channelName")
-        }
-        
-        return isBlocked
+        return false
     }
 
     /**

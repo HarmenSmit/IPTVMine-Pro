@@ -80,7 +80,7 @@ fun TelevisionApp(viewModel: TelevisionViewModel = viewModel()) {
         NetworkUtils.observeConnectivity(context)
     }.collectAsState(initial = NetworkUtils.isNetworkAvailable(context))
 
-    val channels by viewModel.channels.collectAsState()
+    val channels by viewModel.filteredChannels.collectAsState()
     val categories by viewModel.categories.collectAsState()
     val isLoading by viewModel.isLoading.collectAsState()
     val errorMessage by viewModel.errorMessage.collectAsState()
@@ -369,13 +369,7 @@ fun TelevisionApp(viewModel: TelevisionViewModel = viewModel()) {
                     }
                     0 -> {
                         // Live TV channels list
-                        val filteredChannels = remember(channels, selectedCategory) {
-                            if (selectedCategory == "All") {
-                                channels
-                            } else {
-                                channels.filter { it.category == selectedCategory }
-                            }
-                        }
+                        val filteredChannels = channels
 
                         Row(modifier = Modifier.fillMaxSize()) {
                             // Left Categories Sub-Panel (within Live TV content)
