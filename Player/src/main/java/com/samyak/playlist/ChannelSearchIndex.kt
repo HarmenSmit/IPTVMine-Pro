@@ -32,33 +32,49 @@ internal object ChannelSearchTokens {
 internal object ChannelSearchIndex {
     const val TABLE = "channel_search_v1"
 
-    fun initialize(db: SQLiteDatabase) {
-        // The schema and backfill commit together, so an interrupted upgrade is safe to retry.
+    fun initialize(db: SQLiteDatabase, deferBackfill: Boolean) {
         db.beginTransaction()
         try {
+            db.execSQL("CREATE TABLE IF NOT EXISTS playlist_search_backfill(last_id INTEGER NOT NULL)")
             val exists = db.rawQuery("SELECT 1 FROM sqlite_master WHERE name=?", arrayOf(TABLE)).use { it.moveToFirst() }
             if (!exists) {
                 db.execSQL("CREATE VIRTUAL TABLE $TABLE USING fts4(grams, tokenize=simple)")
-                db.compileStatement("INSERT INTO $TABLE(docid,grams) VALUES(?,?)").use { insert ->
-                    var lastId = 0L
-                    do {
-                        var count = 0
-                        db.rawQuery("SELECT id,name FROM channels WHERE id>? ORDER BY id LIMIT 250", arrayOf(lastId.toString())).use { cursor ->
-                            while (cursor.moveToNext()) {
-                                lastId = cursor.getLong(0)
-                                insert.bindLong(1, lastId)
-                                insert.bindString(2, ChannelSearchTokens.document(cursor.getString(1)))
-                                insert.executeInsert()
-                                count++
-                            }
-                        }
-                    } while (count == 250)
-                }
+                db.execSQL("INSERT INTO playlist_search_backfill SELECT 0 WHERE EXISTS (SELECT 1 FROM channels)")
             }
             db.execSQL("CREATE TRIGGER IF NOT EXISTS channel_search_delete AFTER DELETE ON channels BEGIN DELETE FROM $TABLE WHERE docid=old.id; END")
             db.setTransactionSuccessful()
         } finally {
             db.endTransaction()
         }
+        if (!deferBackfill) while (backfillBatch(db)) { /* finish migration for eager callers */ }
+    }
+
+    fun ready(db: SQLiteDatabase): Boolean =
+        db.rawQuery("SELECT 1 FROM playlist_search_backfill", null).use { !it.moveToFirst() }
+
+    fun backfillBatch(db: SQLiteDatabase): Boolean {
+        if (ready(db)) return false
+        db.beginTransactionNonExclusive()
+        try {
+            var last = db.rawQuery("SELECT last_id FROM playlist_search_backfill", null).use {
+                if (it.moveToFirst()) it.getLong(0) else return false
+            }
+            var count = 0
+            db.compileStatement("INSERT OR REPLACE INTO $TABLE(docid,grams) VALUES(?,?)").use { insert ->
+                db.rawQuery("SELECT id,name FROM channels WHERE id>? ORDER BY id LIMIT 250", arrayOf(last.toString())).use { rows ->
+                    while (rows.moveToNext()) {
+                        last = rows.getLong(0)
+                        insert.bindLong(1, last)
+                        insert.bindString(2, ChannelSearchTokens.document(rows.getString(1)))
+                        insert.executeInsert()
+                        count++
+                    }
+                }
+            }
+            if (count < 250) db.delete("playlist_search_backfill", null, null)
+            else db.execSQL("UPDATE playlist_search_backfill SET last_id=?", arrayOf(last))
+            db.setTransactionSuccessful()
+            return count == 250
+        } finally { db.endTransaction() }
     }
 }

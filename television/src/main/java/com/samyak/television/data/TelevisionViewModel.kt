@@ -13,15 +13,20 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.channels.Channel as SignalChannel
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 
 class TelevisionViewModel(application: Application) : AndroidViewModel(application) {
     private val TAG = "TelevisionViewModel"
     private val providerRepository = ProviderRepository(application)
-    private val storeDelegate = lazy { PlaylistStore(application, "iptv-tv-channels.db", Channel::class.java, { it.name }, { it.category }) }
+    private val storeDelegate = lazy {
+        PlaylistStore(application, "iptv-tv-channels.db", Channel::class.java, { it.name }, { it.category }, deferMaintenance = true)
+    }
     private val store by storeDelegate
     private var fetchJob: Job? = null
+    private var maintenanceJob: Job? = null
+    private val maintenanceRequests = SignalChannel<Unit>(SignalChannel.CONFLATED)
     private var filterJob: Job? = null
     private var filterCancellationSignal: CancellationSignal? = null
     private var searchJob: Job? = null
@@ -58,6 +63,23 @@ class TelevisionViewModel(application: Application) : AndroidViewModel(applicati
 
     init {
         refreshChannels(manual = false)
+    }
+
+    fun onChannelScreenReady() {
+        if (maintenanceJob != null) return
+        maintenanceJob = viewModelScope.launch(Dispatchers.IO) {
+            while (isActive) {
+                try {
+                    store.maintain()
+                } catch (cancelled: CancellationException) {
+                    throw cancelled
+                } catch (failure: Exception) {
+                    Log.w(TAG, "Playlist maintenance deferred (${failure.javaClass.simpleName})")
+                }
+                // Retry retired versions once old UI readers have gone away.
+                withTimeoutOrNull(60_000) { maintenanceRequests.receive() }
+            }
+        }
     }
 
     fun selectCategory(category: String) {
@@ -145,8 +167,15 @@ class TelevisionViewModel(application: Application) : AndroidViewModel(applicati
                 val providers = providerRepository.getProviders().filter {
                     it.isActive && it.safeType == com.samyak.television.model.ProviderType.IPTV
                 }
+                val sources = providers.map { it.url }
+                if (_channels.value.isEmpty()) {
+                    val firstPage = store.firstPageIfUncached(sources)
+                    if (firstPage.isNotEmpty()) withContext(Dispatchers.Main) {
+                        if (_selectedCategory.value == "All") _filteredChannels.value = firstPage
+                    }
+                }
                 suspend fun publish() {
-                    val snapshot = store.snapshot(providers.map { it.url })
+                    val snapshot = store.snapshot(sources)
                     withContext(Dispatchers.Main) {
                         if (_channels.value !== snapshot) {
                             _channels.value = snapshot
@@ -161,14 +190,15 @@ class TelevisionViewModel(application: Application) : AndroidViewModel(applicati
                 }
                 publish()
                 var failed = 0
-                var updated = 0
                 for (provider in providers) {
                     ensureActive()
                     if (!manual && !store.needsRefresh(provider.url, 30 * 60 * 1000L)) continue
                     try {
                         store.recordRefreshAttempt(provider.url)
-                        ChannelsLoader.importChannels(provider.url, provider.title, store, getApplication<Application>().cacheDir)
-                        updated++
+                        if (ChannelsLoader.importChannels(provider.url, provider.title, store, getApplication<Application>().cacheDir)) {
+                            publish()
+                            maintenanceRequests.trySend(Unit)
+                        }
                     } catch (cancelled: CancellationException) {
                         throw cancelled
                     } catch (failure: Exception) {
@@ -177,7 +207,6 @@ class TelevisionViewModel(application: Application) : AndroidViewModel(applicati
                         Log.w(TAG, "Playlist import failed (${failure.javaClass.simpleName}); previous data retained")
                     }
                 }
-                if (updated > 0) publish()
                 withContext(Dispatchers.Main) {
                     _errorMessage.value = when {
                         failed > 0 -> "$failed playlist import(s) failed. Previous data retained. Check your connection and playlist URL."
@@ -202,6 +231,8 @@ class TelevisionViewModel(application: Application) : AndroidViewModel(applicati
     }
 
     override fun onCleared() {
+        val maintaining = maintenanceJob
+        maintaining?.cancel()
         fetchJob?.cancel(); filterJob?.cancel(); searchJob?.cancel()
         filterCancellationSignal?.cancel()
         searchCancellationSignal?.cancel()
@@ -209,6 +240,7 @@ class TelevisionViewModel(application: Application) : AndroidViewModel(applicati
         val filtering = filterJob
         val searching = searchJob
         CoroutineScope(Dispatchers.IO).launch {
+            maintaining?.join()
             fetching?.join(); filtering?.join(); searching?.join()
             try {
                 if (storeDelegate.isInitialized()) store.close()

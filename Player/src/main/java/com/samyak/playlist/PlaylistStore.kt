@@ -9,6 +9,15 @@ import com.google.gson.Gson
 import java.io.Closeable
 import java.util.UUID
 import java.lang.ref.WeakReference
+import kotlinx.coroutines.currentCoroutineContext
+import kotlinx.coroutines.ensureActive
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
+
+data class PlaylistVersion(val source: String, val generation: String?, val fingerprint: PlaylistFingerprint?)
+
+private class DifferentChannel : RuntimeException()
 
 /** Disk snapshots preserve the List API without retaining the channel catalogue in the heap. */
 class PlaylistStore<T>(
@@ -16,10 +25,14 @@ class PlaylistStore<T>(
     databaseName: String,
     private val type: Class<T>,
     private val nameOf: (T) -> String,
-    private val categoryOf: (T) -> String
+    private val categoryOf: (T) -> String,
+    private val deferMaintenance: Boolean
 ) : Closeable {
+    constructor(context: Context, databaseName: String, type: Class<T>, nameOf: (T) -> String, categoryOf: (T) -> String) :
+        this(context, databaseName, type, nameOf, categoryOf, deferMaintenance = false)
+
     private val gson = Gson()
-    private val lease = PlaylistDatabases.acquire(context, databaseName)
+    private val lease = PlaylistDatabases.acquire(context, databaseName, deferMaintenance)
     private val db = lease.database
 
     init {
@@ -30,7 +43,7 @@ class PlaylistStore<T>(
         db.execSQL("CREATE INDEX IF NOT EXISTS channels_category ON channels(generation, category, id)")
         db.execSQL("CREATE TABLE IF NOT EXISTS active (source TEXT PRIMARY KEY, generation TEXT NOT NULL)")
         PlaylistCatalogueCache.initialize(db)
-        ChannelSearchIndex.initialize(db)
+        ChannelSearchIndex.initialize(db, deferMaintenance)
     }
 
     inner class Import internal constructor(private val source: String) : Closeable {
@@ -43,6 +56,7 @@ class PlaylistStore<T>(
             private set
         private val insert = db.compileStatement("INSERT INTO channels(generation,name,category,payload) VALUES(?,?,?,?)")
         private val insertSearch = db.compileStatement("INSERT INTO ${ChannelSearchIndex.TABLE}(docid,grams) VALUES(?,?)")
+        init { synchronized(lease) { lease.writing.add(generation) } }
 
         private fun commitBatch() {
             if (transactionOpen) {
@@ -52,10 +66,11 @@ class PlaylistStore<T>(
         }
 
         fun add(value: T) {
+            check(!published)
             val payload = gson.toJson(value)
             // CursorWindow and the decoder must also be protected from oversized records.
             if (payload.toByteArray(Charsets.UTF_8).size > 1024 * 1024) throw PlaylistLimitException("Channel record exceeds 1 MiB")
-            if (!transactionOpen) { db.beginTransaction(); transactionOpen = true }
+            if (!transactionOpen) { db.beginTransactionNonExclusive(); transactionOpen = true }
             insert.bindString(1, generation)
             val name = nameOf(value).lowercase()
             insert.bindString(2, name)
@@ -71,35 +86,105 @@ class PlaylistStore<T>(
         }
 
         fun clear() {
+            check(!published)
             commitBatch()
             db.delete("channels", "generation=?", arrayOf(generation))
             count = 0
         }
 
-        fun publish(checkCancelled: () -> Unit = {}) {
+        fun publish(checkCancelled: () -> Unit = {}) = commit(null, null, checkCancelled)
+
+        fun publishIfCurrent(version: PlaylistVersion, fingerprint: PlaylistFingerprint?, checkCancelled: () -> Unit) {
+            require(version.source == source)
+            commit(version, fingerprint, checkCancelled)
+        }
+
+        private fun commit(version: PlaylistVersion?, fingerprint: PlaylistFingerprint?, checkCancelled: () -> Unit) {
+            check(!published)
             commitBatch()
             if (count == 0) throw java.io.IOException("Playlist contains no valid channels")
-            db.beginTransaction()
+            db.beginTransactionNonExclusive()
             try {
                 checkCancelled()
+                version?.let(::verifyCurrent)
                 db.execSQL("INSERT OR REPLACE INTO playlist_generation_counts VALUES(?,?)", arrayOf<Any>(generation, count))
                 db.execSQL("INSERT OR REPLACE INTO active(source,generation) VALUES(?,?)", arrayOf(source, generation))
-                val now = System.currentTimeMillis()
-                db.execSQL("INSERT OR REPLACE INTO playlist_refresh(source,last_success_ms,last_attempt_ms) VALUES(?,?,?)", arrayOf<Any>(source, now, now))
+                saveCheck(source, generation, fingerprint)
                 db.setTransactionSuccessful()
-                published = true
             } finally { db.endTransaction() }
+            published = true
         }
 
         override fun close() {
             if (transactionOpen) { db.endTransaction(); transactionOpen = false }
             insert.close()
             insertSearch.close()
-            if (!published) db.delete("channels", "generation=?", arrayOf(generation))
+            synchronized(lease) { lease.writing.remove(generation) }
+            if (!published && !deferMaintenance) db.delete("channels", "generation=?", arrayOf(generation))
         }
     }
 
     fun beginImport(source: String): Import = Import(source)
+
+    fun version(source: String): PlaylistVersion = db.rawQuery(
+        """SELECT a.generation,h.sha256,h.etag,h.last_modified FROM active a
+           LEFT JOIN playlist_http_state h ON h.source=a.source AND h.generation=a.generation WHERE a.source=?""",
+        arrayOf(source)
+    ).use { row ->
+        if (!row.moveToFirst()) PlaylistVersion(source, null, null)
+        else PlaylistVersion(source, row.getString(0), if (row.isNull(1)) null else
+            PlaylistFingerprint(row.getString(1), row.getString(2), row.getString(3)))
+    }
+
+    private fun verifyCurrent(expected: PlaylistVersion) {
+        check(version(expected.source).generation == expected.generation) { "Playlist changed during refresh" }
+    }
+
+    fun markUnchanged(expected: PlaylistVersion, fingerprint: PlaylistFingerprint?, checkCancelled: () -> Unit) {
+        db.beginTransactionNonExclusive()
+        try {
+            checkCancelled()
+            verifyCurrent(expected)
+            saveCheck(expected.source, checkNotNull(expected.generation), fingerprint)
+            db.setTransactionSuccessful()
+        } finally { db.endTransaction() }
+    }
+
+    private fun saveCheck(source: String, generation: String, fingerprint: PlaylistFingerprint?) {
+        val now = System.currentTimeMillis()
+        db.execSQL("INSERT OR REPLACE INTO playlist_refresh VALUES(?,?,?)", arrayOf<Any>(source, now, now))
+        if (fingerprint == null) db.delete("playlist_http_state", "source=?", arrayOf(source))
+        else db.execSQL("INSERT OR REPLACE INTO playlist_http_state VALUES(?,?,?,?,?)",
+            arrayOf(source, generation, fingerprint.sha256, fingerprint.etag, fingerprint.lastModified))
+    }
+
+    /** Compare in file order, preserving duplicates, without materializing either playlist. */
+    fun matches(expected: PlaylistVersion, read: ((T) -> Unit) -> Unit): Boolean {
+        val generation = expected.generation ?: return false
+        var lastId = 0L
+        var page: Cursor? = null
+        fun next(): Cursor? {
+            val rows = page
+            if (rows != null && rows.moveToNext()) return rows
+            rows?.close()
+            // Seek by the existing (generation,id) index. Android can otherwise repeatedly
+            // rescan the prefix of a large payload query when it refills its CursorWindow.
+            val nextPage = db.rawQuery("SELECT id,payload FROM channels WHERE generation=? AND id>? ORDER BY id LIMIT 32",
+                arrayOf(generation, lastId.toString()))
+            page = nextPage
+            return nextPage.takeIf { it.moveToFirst() }
+        }
+        return try {
+            read { value ->
+                val row = next() ?: throw DifferentChannel()
+                if (value != gson.fromJson(row.getString(1), type)) throw DifferentChannel()
+                lastId = row.getLong(0)
+            }
+            next() == null
+        } catch (_: DifferentChannel) {
+            false
+        } finally { page?.close() }
+    }
 
     fun count(source: String): Int {
         val generation = db.rawQuery("SELECT generation FROM active WHERE source=?", arrayOf(source)).use { if (it.moveToFirst()) it.getString(0) else null }
@@ -125,11 +210,34 @@ class PlaylistStore<T>(
     private var cachedGenerations: List<String>? = null
     private var cachedSnapshot: ChannelList<T>? = null
 
+    private fun activeGenerations(sources: List<String>) = sources.mapNotNull { source ->
+        db.rawQuery("SELECT generation FROM active WHERE source=?", arrayOf(source)).use {
+            if (it.moveToFirst()) it.getString(0) else null
+        }
+    }.distinct()
+
+    fun firstPageIfUncached(sources: List<String>, limit: Int = 16): List<T> {
+        val generations = activeGenerations(sources)
+        if (generations.isEmpty() || PlaylistCatalogueCache.hasChannelView(db, generations)) return emptyList()
+        return buildList {
+            for (generation in generations) {
+                if (size >= limit) break
+                db.rawQuery("SELECT payload FROM channels WHERE generation=? ORDER BY id LIMIT ?",
+                    arrayOf(generation, (limit - size).toString())).use { rows ->
+                    while (rows.moveToNext()) add(gson.fromJson(rows.getString(0), type))
+                }
+            }
+        }
+    }
+
     @Synchronized fun snapshot(sources: List<String>): ChannelList<T> {
-        val generations = sources.mapNotNull { source ->
-            db.rawQuery("SELECT generation FROM active WHERE source=?", arrayOf(source)).use { if (it.moveToFirst()) it.getString(0) else null }
-        }.distinct()
-        if (generations == cachedGenerations) cachedSnapshot?.let { return it }
+        val generations = synchronized(lease) {
+            val active = activeGenerations(sources)
+            if (active == cachedGenerations) cachedSnapshot?.let { return it }
+            lease.readers.removeAll { it.get() == null }
+            if (active.isNotEmpty()) lease.readers.add(WeakReference(active))
+            active
+        }
         val selection = if (generations.isEmpty()) "0" else "generation IN (${generations.joinToString(",") { "?" }})"
         val order = if (generations.isEmpty()) "id" else "CASE generation " + generations.mapIndexed { index, generation ->
             "WHEN '$generation' THEN $index"
@@ -151,6 +259,11 @@ class PlaylistStore<T>(
     override fun close() {
         PlaylistDatabases.release(lease)
     }
+
+    suspend fun maintain() = lease.maintenance.withLock {
+        while (ChannelSearchIndex.backfillBatch(db)) delay(10)
+        PlaylistDatabases.cleanInBackground(lease)
+    }
 }
 
 class ChannelList<T> internal constructor(
@@ -162,7 +275,8 @@ class ChannelList<T> internal constructor(
     private val order: String,
     cancellationSignal: CancellationSignal? = null,
     persistentView: PlaylistCatalogueCache.View? = null,
-    private val rootGenerations: List<String>? = null
+    private val rootGenerations: List<String>? = null,
+    private val readerGenerations: List<String>? = rootGenerations
 ) : AbstractList<T>() {
     private val table = persistentView?.table ?: ("snapshot_" + UUID.randomUUID().toString().replace("-", ""))
     override val size: Int
@@ -244,7 +358,7 @@ class ChannelList<T> internal constructor(
         var where = selection
         val parameters = args.toMutableList()
         if (key.query.isNotEmpty()) {
-            ChannelSearchTokens.query(key.query)?.let { tokens ->
+            ChannelSearchTokens.query(key.query)?.takeIf { ChannelSearchIndex.ready(db) }?.let { tokens ->
                 // Start with indexed candidates, rather than scanning every name in a generation.
                 // Very long names use a bounded overflow bucket; the literal check handles them.
                 where += " AND id IN (SELECT docid FROM ${ChannelSearchIndex.TABLE} WHERE grams MATCH ? UNION SELECT docid FROM ${ChannelSearchIndex.TABLE} WHERE grams MATCH '${ChannelSearchTokens.OVERFLOW}')"
@@ -254,20 +368,22 @@ class ChannelList<T> internal constructor(
             parameters.add(key.query)
         }
         if (key.category != null) { where += " AND category=?"; parameters.add(key.category) }
-        val result = ChannelList(db, where, parameters.toTypedArray(), gson, type, order, cancellationSignal)
+        val result = ChannelList(db, where, parameters.toTypedArray(), gson, type, order, cancellationSignal,
+            readerGenerations = readerGenerations)
         cancellationSignal?.throwIfCanceled()
         synchronized(filteredCache) { filteredCache[key] = result }
         return result
     }
 
     private var cachedCategoryCounts: List<Pair<String, Int>>? = null
-    @Synchronized fun categoryCounts(): List<Pair<String, Int>> {
+    private val categoryLock = Any()
+    fun categoryCounts(): List<Pair<String, Int>> = synchronized(categoryLock) {
         cachedCategoryCounts?.let { return it }
         val sql = "SELECT category,count(*) FROM channels WHERE $selection GROUP BY category ORDER BY category"
         val view = rootGenerations?.let { generations ->
             PlaylistCatalogueCache.getOrBuild(db, "categories-v1", generations) { table -> db.execSQL("CREATE TABLE $table AS $sql", args) }
         }
-        return SqlList(db, sql, args, view) { it.getString(0) to it.getInt(1) }.also { cachedCategoryCounts = it }
+        SqlList(db, sql, args, view, readerGenerations) { it.getString(0) to it.getInt(1) }.also { cachedCategoryCounts = it }
     }
 
     // StateFlow/Compose must not compare every record in two large snapshots.
@@ -276,7 +392,8 @@ class ChannelList<T> internal constructor(
 }
 
 private class SqlList<T>(
-    private val db: SQLiteDatabase, private val sql: String, private val args: Array<String>, persistentView: PlaylistCatalogueCache.View? = null, private val decode: (Cursor) -> T
+    private val db: SQLiteDatabase, private val sql: String, private val args: Array<String>, persistentView: PlaylistCatalogueCache.View? = null,
+    @Suppress("unused") private val readerGenerations: List<String>?, private val decode: (Cursor) -> T
 ) : AbstractList<T>() {
     private val table = persistentView?.table ?: ("snapshot_" + UUID.randomUUID().toString().replace("-", ""))
     override val size: Int
@@ -323,51 +440,110 @@ fun <T> List<T>.withAll(first: T): List<T> {
 
 /** One connection pool per database; activity recreation cannot close another owner's snapshots. */
 private object PlaylistDatabases {
-    class Lease(val path: String, val database: SQLiteDatabase, var owners: Int = 1) {
+    class Lease(val path: String, val database: SQLiteDatabase, var deferred: Boolean, var owners: Int = 1) {
         val snapshots = mutableMapOf<String, WeakReference<Any>>()
+        val abandoned = mutableListOf<String>()
+        val writing = mutableSetOf<String>()
+        val readers = mutableListOf<WeakReference<List<String>>>()
+        val maintenance = Mutex()
+
+        @Synchronized fun unused(generation: String): Boolean {
+            readers.removeAll { it.get() == null }
+            return generation !in writing && readers.none { it.get()?.contains(generation) == true }
+        }
     }
     private val leases = mutableMapOf<String, Lease>()
 
-    @Synchronized fun acquire(context: Context, name: String): Lease {
+    @Synchronized fun acquire(context: Context, name: String, deferred: Boolean): Lease {
         val path = context.getDatabasePath(name).absolutePath
-        leases[path]?.let { it.owners++; return it }
+        leases[path]?.let { existing ->
+            existing.owners++
+            if (deferred) existing.deferred = true
+            return existing
+        }
         val db = context.openOrCreateDatabase(name, Context.MODE_PRIVATE, null)
         // UI readers can keep reading the previous generation while an import batch writes.
         db.enableWriteAheadLogging()
-        // Recover interrupted processes. No snapshots/importers are alive on the first lease.
+        val lease = Lease(path, db, deferred)
+        // Capture only pre-existing table names before this pool admits new readers.
         db.rawQuery("SELECT name FROM sqlite_master WHERE type='table' AND name LIKE 'snapshot_%'", null).use { cursor ->
             val tables = mutableListOf<String>()
             while (cursor.moveToNext()) tables.add(cursor.getString(0))
-            for (table in tables) if (Regex("snapshot_[a-f0-9]+").matches(table)) db.execSQL("DROP TABLE $table")
+            for (table in tables) if (Regex("snapshot_[a-f0-9]+").matches(table)) {
+                if (deferred) lease.abandoned.add(table) else db.execSQL("DROP TABLE $table")
+            }
         }
-        db.rawQuery("SELECT count(*) FROM sqlite_master WHERE type='table' AND name='active'", null).use {
+        if (!deferred) db.rawQuery("SELECT count(*) FROM sqlite_master WHERE type='table' AND name='active'", null).use {
             if (it.moveToFirst() && it.getInt(0) > 0) {
                 PlaylistCatalogueCache.pruneObsolete(db)
                 pruneChannels(db)
             }
         }
-        return Lease(path, db).also { leases[path] = it }
+        leases[path] = lease
+        return lease
     }
 
     @Synchronized fun register(db: SQLiteDatabase, table: String, snapshot: Any) {
         val lease = leases.values.first { it.database === db }
-        val iterator = lease.snapshots.iterator()
-        while (iterator.hasNext()) {
-            val entry = iterator.next()
-            if (entry.value.get() == null) { db.execSQL("DROP TABLE IF EXISTS ${entry.key}"); iterator.remove() }
+        synchronized(lease) {
+            if (!lease.deferred) {
+                val iterator = lease.snapshots.iterator()
+                while (iterator.hasNext()) {
+                    val entry = iterator.next()
+                    if (entry.value.get() == null) { db.execSQL("DROP TABLE IF EXISTS ${entry.key}"); iterator.remove() }
+                }
+            }
+            lease.snapshots[table] = WeakReference(snapshot)
         }
-        lease.snapshots[table] = WeakReference(snapshot)
     }
 
     @Synchronized fun release(lease: Lease) {
         if (--lease.owners > 0) return
         try {
+            if (lease.deferred) return
             for (table in lease.snapshots.keys) lease.database.execSQL("DROP TABLE IF EXISTS $table")
             PlaylistCatalogueCache.pruneObsolete(lease.database)
             pruneChannels(lease.database)
         } finally {
             lease.database.close()
             leases.remove(lease.path)
+        }
+    }
+
+    suspend fun cleanInBackground(lease: Lease) {
+        val db = lease.database
+        val obsoleteTables = synchronized(lease) {
+            val tables = lease.abandoned.toMutableList()
+            lease.abandoned.clear()
+            val dead = lease.snapshots.filterValues { it.get() == null }.keys
+            tables.addAll(dead)
+            dead.forEach(lease.snapshots::remove)
+            tables
+        }
+        for (table in obsoleteTables) {
+            currentCoroutineContext().ensureActive()
+            db.execSQL("DROP TABLE IF EXISTS $table")
+            delay(10)
+        }
+        PlaylistCatalogueCache.pruneObsolete(db, lease::unused)
+        var after = ""
+        while (true) {
+            currentCoroutineContext().ensureActive()
+            val generation = db.rawQuery("SELECT generation FROM channels WHERE generation>? ORDER BY generation LIMIT 1",
+                arrayOf(after)).use { if (it.moveToFirst()) it.getString(0) else null } ?: break
+            after = generation
+            // Snapshot acquisition and writer registration use this same lock. Once retired,
+            // an unpinned UUID cannot acquire a new reader or be reused by another writer.
+            val eligible = synchronized(lease) {
+                lease.unused(generation) && db.rawQuery("SELECT 1 FROM active WHERE generation=?", arrayOf(generation))
+                    .use { !it.moveToFirst() }
+            }
+            if (!eligible) continue
+            while (db.delete("channels", """id IN (
+                SELECT id FROM channels WHERE generation=? ORDER BY id LIMIT 250
+            ) AND NOT EXISTS (SELECT 1 FROM active WHERE generation=?)""", arrayOf(generation, generation)) > 0) {
+                delay(10)
+            }
         }
     }
 

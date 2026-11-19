@@ -54,6 +54,8 @@ import androidx.compose.ui.res.painterResource
 import androidx.compose.ui.graphics.painter.Painter
 import com.samyak.television.utils.NetworkUtils
 
+private const val LIVE_TV = 0
+
 class MainActivity : ComponentActivity() {
     @OptIn(ExperimentalTvMaterial3Api::class)
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -92,7 +94,14 @@ fun TelevisionApp(viewModel: TelevisionViewModel = viewModel()) {
     val providerRepository = remember { ProviderRepository(context) }
     var providerList by remember { mutableStateOf(providerRepository.getProviders()) }
 
-    var activeScreenIndex by remember { mutableStateOf(1) } // Default to Movies & Shows for a rich experience!
+    var activeScreenIndex by remember { mutableIntStateOf(LIVE_TV) }
+    val channelScreenReady = channels.isNotEmpty() || !isLoading
+    LaunchedEffect(channelScreenReady) {
+        if (channelScreenReady) {
+            withFrameNanos { }
+            viewModel.onChannelScreenReady()
+        }
+    }
     // activeScreenIndex == 0: Live TV Grid (categories)
     // activeScreenIndex == 1: VOD Movies & Shows catalog
     // activeScreenIndex == 2: Search channels or movies
@@ -127,11 +136,11 @@ fun TelevisionApp(viewModel: TelevisionViewModel = viewModel()) {
         viewAllProvider = null
     }
 
-    BackHandler(enabled = selectedMovieLink == null && selectedCategoryForViewAll == null && activeScreenIndex != 1) {
+    BackHandler(enabled = selectedMovieLink == null && selectedCategoryForViewAll == null && activeScreenIndex != LIVE_TV) {
         if (activeScreenIndex == 6) {
             activeScreenIndex = 4
         } else {
-            activeScreenIndex = 1
+            activeScreenIndex = LIVE_TV
         }
     }
 
@@ -200,9 +209,9 @@ fun TelevisionApp(viewModel: TelevisionViewModel = viewModel()) {
                     SidebarItem(
                         painter = painterResource(id = R.drawable.ic_tv),
                         label = "Live TV",
-                        isSelected = activeScreenIndex == 0,
+                        isSelected = activeScreenIndex == LIVE_TV,
                         isExpanded = isSidebarExpanded,
-                        onClick = { activeScreenIndex = 0 }
+                        onClick = { activeScreenIndex = LIVE_TV }
                     )
                     SidebarItem(
                         painter = rememberVectorPainter(Icons.Default.PlayArrow),
@@ -373,7 +382,7 @@ fun TelevisionApp(viewModel: TelevisionViewModel = viewModel()) {
                             }
                         )
                     }
-                    0 -> {
+                    LIVE_TV -> {
                         // Live TV channels list
                         val filteredChannels = channels
 
@@ -485,7 +494,7 @@ fun TelevisionApp(viewModel: TelevisionViewModel = viewModel()) {
                                         verticalArrangement = Arrangement.spacedBy(14.dp),
                                         modifier = Modifier.fillMaxSize()
                                     ) {
-                                        items(filteredChannels, key = { it.name + "_" + it.streamUrl }) { channel ->
+                                        items(filteredChannels) { channel ->
                                             TvChannelCard(channel = channel) {
                                                 com.samyak.player.PlayerActivity.start(context, channel.name, channel.streamUrl)
                                             }
