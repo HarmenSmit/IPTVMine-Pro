@@ -183,13 +183,20 @@ class TelevisionViewModel(application: Application) : AndroidViewModel(applicati
                             updateSearch()
                         }
                     }
-                    val categories = snapshot.categoryCounts().project { it.first }.withAll("All")
+                    val categories = snapshot.categoryCounts()
+                        .map { it.first }
+                        .filterNot { it == "All" }
+                        .sortedWith(
+                            compareByDescending<String> { it.startsWith("nl", ignoreCase = true) }
+                                .thenBy(String.CASE_INSENSITIVE_ORDER) { it }
+                        )
+                        .withAll("All")
                     withContext(Dispatchers.Main) {
                         _categories.value = categories
                     }
                 }
                 publish()
-                var failed = 0
+                val importErrors = mutableListOf<String>()
                 for (provider in providers) {
                     ensureActive()
                     if (!manual && !store.needsRefresh(provider.url, 30 * 60 * 1000L)) continue
@@ -203,13 +210,37 @@ class TelevisionViewModel(application: Application) : AndroidViewModel(applicati
                         throw cancelled
                     } catch (failure: Exception) {
                         ensureActive()
-                        failed++
+                        val reason = when (failure) {
+                            is PlaylistHttpException -> when (failure.statusCode) {
+                                401 -> "HTTP 401 — controleer je inloggegevens."
+                                403 -> "HTTP 403 — de provider weigert toegang."
+                                404 -> "HTTP 404 — de playlist is niet gevonden op dit adres."
+                                else -> "De provider antwoordde met HTTP ${failure.statusCode}."
+                            }
+                            is java.net.MalformedURLException -> "Het playlistadres is ongeldig."
+                            is java.net.UnknownHostException -> "De tv kan de hostnaam van de provider niet vinden."
+                            is java.net.SocketTimeoutException -> "De verbinding met de provider duurde te lang."
+                            is java.net.ConnectException -> failure.message //"De tv kan geen verbinding maken met de provider."
+                            is javax.net.ssl.SSLException -> "De beveiligde verbinding met de provider is mislukt."
+                            is android.database.sqlite.SQLiteFullException -> "De opslag voor de zenderdatabase is vol."
+                            is android.database.sqlite.SQLiteException -> "Databasefout (${failure.javaClass.simpleName})."
+                            is PlaylistLimitException -> failure.message ?: "De playlist overschrijdt een importlimiet."
+                            else -> when (failure.message) {
+                                "Playlist contains no valid channels" -> "De playlist bevat geen geldige zenders."
+                                "Server returned media instead of a playlist" -> "De URL verwijst naar media in plaats van een playlist."
+                                "Partial playlist response", "Incomplete playlist response" -> "De playlist is slechts gedeeltelijk ontvangen."
+                                "Unsupported playlist scheme" -> "Het playlistadres moet met http:// of https:// beginnen."
+                                else -> "Import mislukt (${failure.javaClass.simpleName})."
+                            }
+                        }
+                        val name = provider.title.ifBlank { "Naamloze provider" }
+                        importErrors.add("$name — $reason")
                         Log.w(TAG, "Playlist import failed (${failure.javaClass.simpleName}); previous data retained")
                     }
                 }
                 withContext(Dispatchers.Main) {
                     _errorMessage.value = when {
-                        failed > 0 -> "$failed playlist import(s) failed. Previous data retained. Check your connection and playlist URL."
+                        importErrors.isNotEmpty() -> importErrors.joinToString("\n")
                         _channels.value.isEmpty() -> "No channels loaded. Check your Internet connection and playlist URL."
                         else -> null
                     }
